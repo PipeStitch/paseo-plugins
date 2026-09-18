@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/omercnet/paseo-plugins/compare/paseo-omp-v0.3.0...paseo-omp-v0.3.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **paseo-omp:** preserve nested subagent links ([#105](https://github.com/omercnet/paseo-plugins/issues/105)) ([41b3b87](https://github.com/omercnet/paseo-plugins/commit/41b3b8760cb88be2381f723e400f71469cb1685c))
+
 ## [0.3.0](https://github.com/omercnet/paseo-plugins/compare/paseo-omp-v0.2.1...paseo-omp-v0.3.0) (2026-09-18)
 
 
