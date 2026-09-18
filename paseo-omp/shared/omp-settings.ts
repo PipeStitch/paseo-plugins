@@ -17,6 +17,163 @@ export type OmpSettingType = z.infer<typeof OmpSettingTypeSchema>;
 export const OmpScalarValueSchema = z.union([z.boolean(), z.number(), z.string()]);
 export type OmpScalarValue = z.infer<typeof OmpScalarValueSchema>;
 
+const MAX_ROUTING_ENTRIES = 64;
+const MAX_FALLBACK_CHAIN_LENGTH = 16;
+const MAX_AGENT_MODEL_CHOICES = 8;
+const MAX_MODEL_SELECTOR_LENGTH = 513;
+
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint < 32 || codePoint === 127) return true;
+  }
+  return false;
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
+export const OmpRoleNameSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(
+    /^[A-Za-z][A-Za-z0-9_-]*$/,
+    "Role names must start with a letter and use only letters, digits, _ or -.",
+  );
+
+export const OmpModelSelectorSchema = z
+  .string()
+  .min(1)
+  .max(MAX_MODEL_SELECTOR_LENGTH)
+  .refine(
+    (value) => utf8ByteLength(value) <= MAX_MODEL_SELECTOR_LENGTH,
+    `Model selectors must not exceed ${MAX_MODEL_SELECTOR_LENGTH} UTF-8 bytes.`,
+  )
+  .refine(
+    (value) => value === value.trim() && !/\s/u.test(value) && !containsControlCharacter(value),
+    {
+      message: "Model selectors must be a single printable token.",
+    },
+  );
+
+export function isValidOmpModelSelector(value: string): boolean {
+  return OmpModelSelectorSchema.safeParse(value).success;
+}
+
+const OmpAgentNameSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => value === value.trim() && !containsControlCharacter(value), {
+    message: "Agent names cannot have surrounding whitespace or control characters.",
+  });
+
+export const OmpModelRolesSchema = z
+  .record(OmpRoleNameSchema, OmpModelSelectorSchema)
+  .refine((value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES, "Too many model roles.");
+
+const OmpFallbackKeySchema = z.string().superRefine((value, context) => {
+  const schema = value.includes("/") ? OmpModelSelectorSchema : OmpRoleNameSchema;
+  const result = schema.safeParse(value);
+  if (!result.success) {
+    context.addIssue({
+      code: "custom",
+      message: result.error.issues[0]?.message ?? "Invalid fallback chain key.",
+    });
+  }
+});
+
+export const OmpFallbackChainsSchema = z
+  .record(OmpFallbackKeySchema, z.array(OmpModelSelectorSchema).max(MAX_FALLBACK_CHAIN_LENGTH))
+  .refine((value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES, "Too many fallback chains.");
+
+export const OmpCycleOrderSchema = z
+  .array(OmpRoleNameSchema)
+  .max(MAX_ROUTING_ENTRIES)
+  .refine((value) => new Set(value).size === value.length, "Cycle roles must be unique.");
+
+export const OmpAgentModelOverridesSchema = z
+  .record(
+    OmpAgentNameSchema,
+    z.union([
+      OmpModelSelectorSchema,
+      z.array(OmpModelSelectorSchema).min(1).max(MAX_AGENT_MODEL_CHOICES),
+    ]),
+  )
+  .refine(
+    (value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES,
+    "Too many agent model overrides.",
+  );
+
+export const OmpAgentServiceTierOverridesSchema = z
+  .record(
+    OmpAgentNameSchema,
+    z.enum(["inherit", "none", "auto", "default", "flex", "scale", "priority"]),
+  )
+  .refine(
+    (value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES,
+    "Too many agent service tier overrides.",
+  );
+
+const OmpAgentToggleOrSelectorSchema = z.union([z.enum(["on", "off"]), OmpModelSelectorSchema]);
+
+export const OmpAgentPrewalkSchema = z
+  .record(OmpAgentNameSchema, OmpAgentToggleOrSelectorSchema)
+  .refine(
+    (value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES,
+    "Too many agent prewalk overrides.",
+  );
+
+export const OmpAgentAdvisorSchema = z
+  .record(OmpAgentNameSchema, OmpAgentToggleOrSelectorSchema)
+  .refine(
+    (value) => Object.keys(value).length <= MAX_ROUTING_ENTRIES,
+    "Too many agent advisor overrides.",
+  );
+
+export const OMP_STRUCTURED_SETTING_PATHS = [
+  "modelRoles",
+  "retry.fallbackChains",
+  "cycleOrder",
+  "task.agentModelOverrides",
+  "task.agentServiceTierOverrides",
+  "task.agentPrewalk",
+  "task.agentAdvisor",
+] as const;
+export type OmpStructuredSettingPath = (typeof OMP_STRUCTURED_SETTING_PATHS)[number];
+
+export function parseOmpStructuredSettingValue(path: string, value: unknown): unknown | undefined {
+  switch (path) {
+    case "modelRoles":
+      return OmpModelRolesSchema.safeParse(value).data;
+    case "retry.fallbackChains":
+      return OmpFallbackChainsSchema.safeParse(value).data;
+    case "cycleOrder":
+      return OmpCycleOrderSchema.safeParse(value).data;
+    case "task.agentModelOverrides":
+      return OmpAgentModelOverridesSchema.safeParse(value).data;
+    case "task.agentServiceTierOverrides":
+      return OmpAgentServiceTierOverridesSchema.safeParse(value).data;
+    case "task.agentPrewalk":
+      return OmpAgentPrewalkSchema.safeParse(value).data;
+    case "task.agentAdvisor":
+      return OmpAgentAdvisorSchema.safeParse(value).data;
+    default:
+      return undefined;
+  }
+}
+
+export function isOmpStructuredSettingPath(path: string): path is OmpStructuredSettingPath {
+  return (OMP_STRUCTURED_SETTING_PATHS as readonly string[]).includes(path);
+}
+
 export const OmpSettingSchema = z
   .object({
     path: z.string(),
@@ -184,9 +341,76 @@ export const listOmpSettings = defineRpc({
   }),
 });
 
-const OmpSettingChangeSchema = z.discriminatedUnion("operation", [
-  z.object({ operation: z.literal("set"), path: z.string().min(1), value: OmpScalarValueSchema }),
-  z.object({ operation: z.literal("reset"), path: z.string().min(1) }),
+const OmpScalarSettingPathSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (path) => !isOmpStructuredSettingPath(path),
+    "Structured routing settings require typed values.",
+  );
+
+const OmpStructuredSettingChangeSchema = z.discriminatedUnion("path", [
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("modelRoles"),
+      value: OmpModelRolesSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("retry.fallbackChains"),
+      value: OmpFallbackChainsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("cycleOrder"),
+      value: OmpCycleOrderSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("task.agentModelOverrides"),
+      value: OmpAgentModelOverridesSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("task.agentServiceTierOverrides"),
+      value: OmpAgentServiceTierOverridesSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("task.agentPrewalk"),
+      value: OmpAgentPrewalkSchema,
+    })
+    .strict(),
+  z
+    .object({
+      operation: z.literal("set"),
+      path: z.literal("task.agentAdvisor"),
+      value: OmpAgentAdvisorSchema,
+    })
+    .strict(),
+]);
+
+const OmpSettingChangeSchema = z.union([
+  z
+    .object({
+      operation: z.literal("set"),
+      path: OmpScalarSettingPathSchema,
+      value: OmpScalarValueSchema,
+    })
+    .strict(),
+  OmpStructuredSettingChangeSchema,
+  z.object({ operation: z.literal("reset"), path: z.string().min(1) }).strict(),
 ]);
 
 export const updateOmpSettings = defineRpc({

@@ -5,12 +5,13 @@ import { delimiter, dirname, isAbsolute, join } from "node:path";
 import type { RpcInput } from "@getpaseo/plugin";
 import { parseDocument, parse as parseYaml } from "yaml";
 import {
+  isOmpStructuredSettingPath,
   type listOmpSettings,
   OMP_SETTINGS_CATALOG_VERSION,
-  type OmpScalarValue,
   type OmpSetting,
   type OmpSettingType,
   OmpSettingTypeSchema,
+  parseOmpStructuredSettingValue,
   type updateOmpSettings,
 } from "../shared/omp-settings";
 import { SerialMutationQueue } from "./mutation-queue";
@@ -305,12 +306,26 @@ async function loadCatalog(
   }
 }
 
-function serializeScalar(type: OmpSettingType, value: OmpScalarValue): string | null {
-  if (type === "boolean") return typeof value === "boolean" ? String(value) : null;
-  if (type === "number")
+function serializeSettingValue(setting: OmpSetting, value: unknown): string | null {
+  if (isOmpStructuredSettingPath(setting.path)) {
+    const expectedType = setting.path === "cycleOrder" ? "array" : "record";
+    if (setting.type !== expectedType) return null;
+    const parsed = parseOmpStructuredSettingValue(setting.path, value);
+    return parsed === undefined ? null : JSON.stringify(parsed);
+  }
+  if (setting.type === "boolean") return typeof value === "boolean" ? String(value) : null;
+  if (setting.type === "number")
     return typeof value === "number" && Number.isFinite(value) ? String(value) : null;
-  if (type === "string" || type === "enum") return typeof value === "string" ? value : null;
+  if (setting.type === "string" || setting.type === "enum")
+    return typeof value === "string" ? value : null;
   return null;
+}
+
+function isEditableSetting(setting: OmpSetting): boolean {
+  if (setting.redacted) return false;
+  if (["boolean", "number", "string", "enum"].includes(setting.type)) return true;
+  if (!isOmpStructuredSettingPath(setting.path)) return false;
+  return setting.type === (setting.path === "cycleOrder" ? "array" : "record");
 }
 
 export async function listOmpSettingsWithDependencies(
@@ -373,26 +388,22 @@ export async function updateOmpSettingsWithDependencies(
   if (input.cwd) {
     for (const change of input.changes) {
       const setting = byPath.get(change.path);
-      if (
-        !setting ||
-        setting.redacted ||
-        !["boolean", "number", "string", "enum"].includes(setting.type)
-      ) {
+      if (!setting || !isEditableSetting(setting)) {
         return {
           conflict: false,
           appliedPaths: [],
           failed: {
             path: change.path,
-            message: "This setting cannot be edited as a workspace scalar value.",
+            message: "This setting cannot be edited through the focused configuration editor.",
           },
           catalog: current,
         };
       }
-      if (change.operation === "set" && serializeScalar(setting.type, change.value) === null) {
+      if (change.operation === "set" && serializeSettingValue(setting, change.value) === null) {
         return {
           conflict: false,
           appliedPaths: [],
-          failed: { path: change.path, message: `Expected a ${setting.type} value.` },
+          failed: { path: change.path, message: `Invalid ${change.path} value.` },
           catalog: current,
         };
       }
@@ -440,15 +451,14 @@ export async function updateOmpSettingsWithDependencies(
   const appliedPaths: string[] = [];
   for (const change of input.changes) {
     const setting = byPath.get(change.path);
-    if (
-      !setting ||
-      setting.redacted ||
-      !["boolean", "number", "string", "enum"].includes(setting.type)
-    ) {
+    if (!setting || !isEditableSetting(setting)) {
       return {
         conflict: false,
         appliedPaths,
-        failed: { path: change.path, message: "This setting cannot be edited as a scalar value." },
+        failed: {
+          path: change.path,
+          message: "This setting cannot be edited through the focused configuration editor.",
+        },
         catalog: await loadCatalog(executable, dependencies, input.cwd),
       };
     }
@@ -456,7 +466,7 @@ export async function updateOmpSettingsWithDependencies(
     if (change.operation === "reset") {
       args = ["reset", change.path];
     } else {
-      const value = serializeScalar(setting.type, change.value);
+      const value = serializeSettingValue(setting, change.value);
       args = value === null ? null : ["set", change.path, "--json", "--", value];
     }
     if (!args) {

@@ -6,6 +6,7 @@ import {
 } from "./server/mcp-browser";
 import { resolveListOmpMemory } from "./server/memory";
 import { resolveListOmpConfig } from "./server/omp-config";
+import { resolveListOmpModels } from "./server/omp-models";
 import {
   resolveInspectOmpPluginConfig,
   resolveListOmpPlugins,
@@ -29,6 +30,7 @@ import { listHubProcesses, tailHubLog } from "./shared/hub";
 import { openOmpMcpAuthorizationInPaseoBrowser } from "./shared/mcp";
 import { listOmpMemory } from "./shared/memory";
 import { listOmpConfig } from "./shared/omp-config";
+import { listOmpModels } from "./shared/omp-models";
 import {
   inspectOmpPluginConfig,
   listOmpPlugins,
@@ -59,6 +61,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(listOmpMemory, scoped(resolveListOmpMemory));
   server.handle(listOmpSessions, scoped(resolveListOmpSessions));
   server.handle(listOmpConfig, scoped(resolveListOmpConfig));
+  server.handle(listOmpModels, scoped(resolveListOmpModels));
   server.handle(listOmpPlugins, scoped(resolveListOmpPlugins));
   server.handle(inspectOmpPluginConfig, scoped(resolveInspectOmpPluginConfig));
   server.handle(mutateOmpPlugin, scoped(resolveMutateOmpPlugin));
