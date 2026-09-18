@@ -1,3 +1,4 @@
+import * as PaseoClient from "@getpaseo/plugin/client";
 import { type PluginSurfaceProps, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -24,6 +25,7 @@ import {
   hasActiveAgent,
   matchesRow,
   mergeInboxRows,
+  openPullRequestUrl,
   type PaseoApi,
   type PaseoWorkspace,
   type RadarBucket,
@@ -38,6 +40,11 @@ const CLOCK_TICK_MS = 30_000;
 
 type SavedView = "security" | "updated" | "stale" | "automation";
 
+const openExternalUrlCandidate: unknown = Reflect.get(PaseoClient, "openExternalUrl");
+const guardedOpenExternalUrl =
+  typeof openExternalUrlCandidate === "function"
+    ? (openExternalUrlCandidate as (url: string) => Promise<void>)
+    : undefined;
 const SAVED_VIEW_TITLES: Record<SavedView, string> = {
   security: "Security",
   updated: "Updated",
@@ -235,7 +242,10 @@ export function PrRadar({ theme, layout, host, navigation }: PluginSurfaceProps)
             })
           : paseo.workspaces.ref(action.workspaceId);
       const created = await targetWorkspace.agents.create(agentOptions);
-      navigation?.openAgent({ agentId: created.id });
+      if (navigation) {
+        const target = { agentId: created.id, serverId: host.id };
+        navigation.openAgent(target);
+      }
       return `Started ${profile.name} for ${row.repository}#${row.number ?? "PR"}.`;
     },
     onMutate: () => {
@@ -513,7 +523,7 @@ export function PrRadar({ theme, layout, host, navigation }: PluginSurfaceProps)
   const openPr = useCallback(async (row: RadarRow) => {
     setOpenError(null);
     try {
-      await Linking.openURL(row.url);
+      await openPullRequestUrl(row.url, guardedOpenExternalUrl, Linking);
     } catch {
       setOpenError(`Could not open ${row.repository}#${row.number ?? "PR"}.`);
     }
@@ -566,7 +576,10 @@ export function PrRadar({ theme, layout, host, navigation }: PluginSurfaceProps)
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`Open agent ${primaryAgent.title}`}
-            onPress={() => navigation.openAgent({ agentId: primaryAgent.id })}
+            onPress={() => {
+              const target = { agentId: primaryAgent.id, serverId: host.id };
+              navigation.openAgent(target);
+            }}
             style={({ pressed }) => [styles.action, pressed && styles.refreshPressed]}
           >
             <Text style={styles.actionText}>Open agent</Text>
@@ -576,7 +589,10 @@ export function PrRadar({ theme, layout, host, navigation }: PluginSurfaceProps)
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={`Open workspace for ${item.repository} ${item.number ?? ""}`}
-            onPress={() => navigation.openWorkspace({ workspaceId: item.workspaceIds[0] })}
+            onPress={() => {
+              const target = { workspaceId: item.workspaceIds[0], serverId: host.id };
+              navigation.openWorkspace(target);
+            }}
             style={({ pressed }) => [styles.action, pressed && styles.refreshPressed]}
           >
             <Text style={styles.actionText}>Open workspace</Text>
