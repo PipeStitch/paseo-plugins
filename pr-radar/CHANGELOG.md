@@ -6,6 +6,13 @@
 
 * Migrate PR Radar to Paseo 0.8 runtime entries.
 
+## [0.4.1](https://github.com/omercnet/paseo-plugins/compare/pr-radar-v0.4.0...pr-radar-v0.4.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **pr-radar:** fix version constraint for paseo in JSON ([#104](https://github.com/omercnet/paseo-plugins/issues/104)) ([13f076d](https://github.com/omercnet/paseo-plugins/commit/13f076d6235c33b543193cbe90e7ab0d887a996c))
+
 ## [0.4.0](https://github.com/omercnet/paseo-plugins/compare/pr-radar-v0.3.4...pr-radar-v0.4.0) (2026-09-18)
 
 
