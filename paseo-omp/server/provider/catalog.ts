@@ -48,6 +48,27 @@ const THINKING_OPTIONS: readonly ProviderThinkingOption[] = [
   { id: "xhigh", label: "XHigh", description: "Extra-high reasoning" },
   { id: "max", label: "Max", description: "Maximum reasoning" },
 ];
+export const OMP_MAX_CATALOG_MODELS = 256;
+
+export function selectOmpModels(
+  models: readonly OmpModel[],
+  activeModel: OmpModel | null | undefined,
+): OmpModel[] {
+  if (models.length <= OMP_MAX_CATALOG_MODELS) return [...models];
+  const selected = models.slice(0, OMP_MAX_CATALOG_MODELS);
+  if (!activeModel) return selected;
+  const active = models.find(
+    (model) => model.provider === activeModel.provider && model.id === activeModel.id,
+  );
+  if (
+    !active ||
+    selected.some((model) => model.provider === active.provider && model.id === active.id)
+  ) {
+    return selected;
+  }
+  selected[OMP_MAX_CATALOG_MODELS - 1] = active;
+  return selected;
+}
 
 export function nativeOmpModelId(model: OmpModel): string {
   if (model.provider.includes("/")) {
@@ -60,14 +81,9 @@ export function ompModelId(model: OmpModel): string {
   const nativeIdentity = `${Buffer.byteLength(model.provider, "utf8")}:${model.provider}${Buffer.byteLength(model.id, "utf8")}:${model.id}`;
   return `omp:model:${createHash("sha256").update(nativeIdentity).digest("hex")}`;
 }
-
-export function mapOmpModels(
-  models: readonly OmpModel[],
-  serializer = new OmpPublicDataSerializer(),
-): ProviderModel[] {
+export function validateOmpModelIdentities(models: readonly OmpModel[]): void {
   const seenIds = new Map<string, string>();
-  return models.map((model) => {
-    const thinkingOptions = thinkingForModel(model);
+  for (const model of models) {
     const id = ompModelId(model);
     const nativeIdentity = nativeOmpModelId(model);
     const existing = seenIds.get(id);
@@ -76,6 +92,17 @@ export function mapOmpModels(
     }
     if (existing !== undefined) throw new Error("OMP reported a duplicate model identity");
     seenIds.set(id, nativeIdentity);
+  }
+}
+
+export function mapOmpModels(
+  models: readonly OmpModel[],
+  serializer = new OmpPublicDataSerializer(),
+): ProviderModel[] {
+  validateOmpModelIdentities(models);
+  return models.map((model) => {
+    const thinkingOptions = thinkingForModel(model);
+    const id = ompModelId(model);
     const provider = serializer.text(model.provider, 256);
     const modelId = serializer.text(model.id, 256);
     const name = model.name ? serializer.text(model.name, 256) : modelId;
@@ -143,14 +170,16 @@ export async function discoverOmpCatalog(
         ? [...configuredValues, ...(session.inheritedRedactionValues ?? [])]
         : configuredValues,
     );
-    const models = mapOmpModels(nativeModels, serializer);
+    validateOmpModelIdentities(nativeModels);
+    const selectedNativeModels = selectOmpModels(nativeModels, state.model);
+    const models = mapOmpModels(selectedNativeModels, serializer);
     if (models.length === 0) throw new Error("OMP reported no available models");
     const defaultModel = state.model ? ompModelId(state.model) : models[0]?.id;
     const currentModel = state.model
-      ? nativeModels.find(
+      ? selectedNativeModels.find(
           (model) => model.provider === state.model?.provider && model.id === state.model.id,
         )
-      : nativeModels[0];
+      : selectedNativeModels[0];
     if (state.model && !currentModel) throw new Error("OMP reported an unadvertised active model");
     const thinkingOptions = thinkingForModel(currentModel);
     const defaultThinkingOption = thinkingOptions.some(

@@ -11,7 +11,15 @@ import type {
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import { getForgeDefinitionOrNeutral } from "@getpaseo/protocol/forge-manifest";
-import { mapOmpModels, nativeOmpModelId, OMP_MODES, ompModelId, thinkingForModel } from "./catalog";
+import {
+  mapOmpModels,
+  nativeOmpModelId,
+  OMP_MODES,
+  ompModelId,
+  selectOmpModels,
+  thinkingForModel,
+  validateOmpModelIdentities,
+} from "./catalog";
 import {
   normalizeOmpSessionConfig,
   type OmpRecoveryOptions,
@@ -939,6 +947,8 @@ export class OmpProviderSession {
   private readonly pendingToolPermissions = new Map<string, PendingToolPermission>();
   private readonly inFlightToolPermissions = new Map<string, PendingToolPermission>();
   private readonly resolvedToolApprovalIds = new BoundedStringSet(MAX_TRACKED_ENTRY_IDS);
+  private unsupportedThinkingNoticePending = false;
+  private unsupportedThinkingNoticePublished = false;
 
   private constructor(
     id: string,
@@ -1057,10 +1067,9 @@ export class OmpProviderSession {
     }
     const startOptions: OmpStartOptions = {
       ...normalizedConfig,
-      // Model selection is authorized only after this runtime reports its exact catalog.
-      ...(resumeSessionId
-        ? { thinkingOption: undefined, systemPrompt: undefined, resumeSessionId }
-        : {}),
+      // Thinking is authorized only after this runtime reports its exact model catalog.
+      thinkingOption: undefined,
+      ...(resumeSessionId ? { systemPrompt: undefined, resumeSessionId } : {}),
       signal,
       environment,
     };
@@ -1096,6 +1105,7 @@ export class OmpProviderSession {
           () => ({ available: false, commands: [] }),
         ),
       ]);
+      validateOmpModelIdentities(nativeModels);
       if (effectiveConfig.persist && !native.canReplayHistory) {
         throw new OmpPublicError("OMP session persistence requires negotiated RPC protocol v2");
       }
@@ -1109,12 +1119,10 @@ export class OmpProviderSession {
       if (resumeSessionId && initialState.sessionId !== resumeSessionId) {
         throw new OmpPublicError("OMP resumed a different native session");
       }
-      const models = mapOmpModels(nativeModels, new OmpPublicDataSerializer(outputRedactionValues));
-      const nativeModelsByPublicId = new Map(
-        nativeModels.map((model) => [ompModelId(model), model] as const),
-      );
       if (!resumeSessionId && input.config.model) {
-        const selected = nativeModelsByPublicId.get(input.config.model);
+        const selected = selectOmpModels(nativeModels, state.model).find(
+          (model) => ompModelId(model) === input.config.model,
+        );
         if (!selected) {
           throw new OmpPublicError("OMP model is not advertised by the configured session runtime");
         }
@@ -1123,9 +1131,7 @@ export class OmpProviderSession {
           state = await native.getState();
         }
       }
-      const reconciledConfigRevision = bootstrapConfigRevision;
-      state = await native.getState();
-      const currentModel = state.model
+      let currentModel = state.model
         ? nativeModels.find(
             (model) => model.provider === state.model?.provider && model.id === state.model.id,
           )
@@ -1133,21 +1139,43 @@ export class OmpProviderSession {
       if (state.model && !currentModel) {
         throw new OmpPublicError("OMP runtime selected an unadvertised model");
       }
+      if (!resumeSessionId && input.config.thinkingOption !== undefined) {
+        if (
+          !thinkingForModel(currentModel).some(
+            (option) => option.id === input.config.thinkingOption,
+          )
+        ) {
+          throw new OmpPublicError("OMP thinking level is unavailable for the selected model");
+        }
+        if (state.thinkingLevel !== input.config.thinkingOption) {
+          await native.setThinkingLevel(input.config.thinkingOption);
+        }
+      }
+      const reconciledConfigRevision = bootstrapConfigRevision;
+      state = await native.getState();
+      currentModel = state.model
+        ? nativeModels.find(
+            (model) => model.provider === state.model?.provider && model.id === state.model.id,
+          )
+        : undefined;
+      if (state.model && !currentModel) {
+        throw new OmpPublicError("OMP runtime selected an unadvertised model");
+      }
+      const selectedNativeModels = selectOmpModels(nativeModels, state.model);
+      const models = mapOmpModels(
+        selectedNativeModels,
+        new OmpPublicDataSerializer(outputRedactionValues),
+      );
+      const nativeModelsByPublicId = new Map(
+        nativeModels.map((model) => [ompModelId(model), model] as const),
+      );
       const thinkingOptions = thinkingForModel(currentModel);
-      const committedThinkingLevel = applicableThinkingLevel(currentModel, state.thinkingLevel);
-      if (
-        !resumeSessionId &&
-        input.config.thinkingOption !== undefined &&
-        !thinkingOptions.some((option) => option.id === input.config.thinkingOption)
-      ) {
-        throw new OmpPublicError("OMP thinking level is unavailable for the selected model");
-      }
-      if (
-        committedThinkingLevel &&
-        !thinkingOptions.some((option) => option.id === committedThinkingLevel)
-      ) {
-        throw new OmpPublicError("OMP runtime selected an unsupported thinking level");
-      }
+      const applicableLevel = applicableThinkingLevel(currentModel, state.thinkingLevel);
+      const committedThinkingLevel = thinkingOptions.some((option) => option.id === applicableLevel)
+        ? applicableLevel
+        : undefined;
+      const unsupportedThinkingLevel =
+        applicableLevel !== undefined && committedThinkingLevel === undefined;
       const configState: ProviderConfigState = {
         ...(state.model ? { model: ompModelId(state.model) } : {}),
         mode: normalizedConfig.mode ?? "full",
@@ -1210,6 +1238,7 @@ export class OmpProviderSession {
         retireRewindSession,
         scheduler,
       );
+      session.unsupportedThinkingNoticePending = unsupportedThinkingLevel;
 
       if (bootstrapConfigRevision !== reconciledConfigRevision) {
         session.configRefreshDirty = true;
@@ -1268,12 +1297,29 @@ export class OmpProviderSession {
         : {}),
       ...(this.config.title ? { title: this.dataFilter.text(this.config.title, 256) } : {}),
     });
+    this.publishUnsupportedThinkingNotice();
     this.emit({ type: "session.config", sessionId: this.id, config: this.configState });
     if (this.replayHistoryOnOpen) await this.replayHistory(true);
     this.publishCommands(this.commandCatalog);
     this.emit({ type: "session.ready", requestId, sessionId: this.id });
     this.readyPublished = true;
     if (this.configRefreshDirty) this.scheduleCommittedConfigRefresh();
+  }
+  private publishUnsupportedThinkingNotice(): void {
+    if (!this.unsupportedThinkingNoticePending || this.unsupportedThinkingNoticePublished) return;
+    this.unsupportedThinkingNoticePending = false;
+    this.unsupportedThinkingNoticePublished = true;
+    this.emit({
+      type: "session.notice",
+      sessionId: this.id,
+      notice: {
+        id: "omp:unsupported-thinking-level",
+        severity: "warning",
+        title: "OMP thinking level unavailable",
+        description:
+          "OMP reported a thinking level that the active model does not advertise. Paseo omitted it from the session configuration.",
+      },
+    });
   }
 
   private usageFrom(
@@ -1685,6 +1731,17 @@ export class OmpProviderSession {
       if (this.activeTurn || beforeState.isStreaming || beforeState.isCompacting) {
         throw new OmpPublicError("Cannot rewind the OMP conversation while a turn is active");
       }
+      const beforeAdvertisedModel = beforeState.model
+        ? this.nativeModelsByPublicId.get(ompModelId(beforeState.model))
+        : undefined;
+      if (beforeState.model && !beforeAdvertisedModel) {
+        throw new OmpPublicError("OMP runtime selected an unadvertised model");
+      }
+      const restorableThinkingLevel = thinkingForModel(beforeAdvertisedModel).some(
+        (option) => option.id === beforeState.thinkingLevel,
+      )
+        ? beforeState.thinkingLevel
+        : undefined;
       branchMutationPossible = true;
       let result: OmpBranchResult;
       try {
@@ -1727,13 +1784,10 @@ export class OmpProviderSession {
         }
         await runtime.setModel(beforeState.model.provider, beforeState.model.id);
       }
-      if (thinkingChanged) {
-        if (!beforeState.thinkingLevel) {
-          throw new OmpPublicError("OMP changed thinking level while rewinding the conversation");
-        }
-        await runtime.setThinkingLevel(beforeState.thinkingLevel);
+      if (thinkingChanged && restorableThinkingLevel) {
+        await runtime.setThinkingLevel(restorableThinkingLevel);
       }
-      if (modelChanged || thinkingChanged) {
+      if (modelChanged || (thinkingChanged && restorableThinkingLevel)) {
         state = await runtime.getState();
         this.requireCurrentRuntime(runtime, generation);
       }
@@ -1741,7 +1795,7 @@ export class OmpProviderSession {
         state.sessionId !== this.nativeSessionId ||
         state.model?.provider !== beforeState.model?.provider ||
         state.model?.id !== beforeState.model?.id ||
-        state.thinkingLevel !== beforeState.thinkingLevel
+        (restorableThinkingLevel !== undefined && state.thinkingLevel !== restorableThinkingLevel)
       ) {
         throw new OmpPublicError("OMP did not preserve session configuration while rewinding");
       }
@@ -2341,7 +2395,10 @@ export class OmpProviderSession {
       const targetModel = targetModelId
         ? this.nativeModelsByPublicId.get(targetModelId)
         : undefined;
-      if (input.changes.model !== undefined && !targetModel) {
+      const targetModelPublished = this.configState.models.some(
+        (model) => model.id === targetModelId,
+      );
+      if (input.changes.model !== undefined && (!targetModel || !targetModelPublished)) {
         throw new OmpPublicError("OMP model selection is unavailable");
       }
       if (
@@ -2588,13 +2645,18 @@ export class OmpProviderSession {
       throw new OmpCatalogEscape("OMP runtime selected an unadvertised model");
     }
     const thinkingOptions = thinkingForModel(advertisedModel);
-    const committedThinkingLevel = applicableThinkingLevel(advertisedModel, state.thinkingLevel);
-    if (
-      committedThinkingLevel &&
-      !thinkingOptions.some((option) => option.id === committedThinkingLevel)
-    ) {
-      throw new OmpCatalogEscape("OMP runtime selected an unsupported thinking level");
+    const applicableLevel = applicableThinkingLevel(advertisedModel, state.thinkingLevel);
+    const committedThinkingLevel = thinkingOptions.some((option) => option.id === applicableLevel)
+      ? applicableLevel
+      : undefined;
+    if (applicableLevel !== undefined && committedThinkingLevel === undefined) {
+      this.unsupportedThinkingNoticePending = true;
+      this.publishUnsupportedThinkingNotice();
     }
+    const models = mapOmpModels(
+      selectOmpModels([...this.nativeModelsByPublicId.values()], state.model),
+      this.dataFilter,
+    );
     this.configRefreshAttempts = 0;
     this.cancelConfigRefreshRetry();
     const nextConfig: ProviderConfigState = {
@@ -2603,12 +2665,15 @@ export class OmpProviderSession {
       ...(committedThinkingLevel
         ? { thinkingOption: committedThinkingLevel }
         : { thinkingOption: undefined }),
+      models,
       thinkingOptions,
     };
     const changed =
       force ||
       nextConfig.model !== this.configState.model ||
       nextConfig.thinkingOption !== this.configState.thinkingOption ||
+      nextConfig.models.some((model, index) => model.id !== this.configState.models[index]?.id) ||
+      this.configState.models.length !== nextConfig.models.length ||
       nextConfig.thinkingOptions.length !== this.configState.thinkingOptions.length ||
       nextConfig.thinkingOptions.some(
         (option, index) =>
@@ -2928,13 +2993,6 @@ export class OmpProviderSession {
         : undefined;
       if (state.model && !advertisedModel) {
         throw new Error("OMP recovered with an unadvertised model");
-      }
-      const recoveredThinkingLevel = applicableThinkingLevel(advertisedModel, state.thinkingLevel);
-      if (
-        recoveredThinkingLevel &&
-        !thinkingForModel(advertisedModel).some((option) => option.id === recoveredThinkingLevel)
-      ) {
-        throw new Error("OMP recovered with an unsupported thinking level");
       }
       if (this.closed) throw new Error("OMP session closed while runtime recovery was pending");
       if (!this.hostTools.isBoundTo(recovered)) {

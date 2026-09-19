@@ -409,8 +409,7 @@ class FakeOmpSession implements OmpRuntimeSession {
   totalCostUsd = 0.25;
   isStreaming = false;
   isCompacting = false;
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined =
-    "medium";
+  thinkingLevel: string | undefined = "medium";
   promptAgentInvoked: boolean | undefined = true;
   promptEvents: OmpRpcEvent[] = [];
   promptError: Error | null = null;
@@ -740,7 +739,7 @@ class FakeOmpRuntime implements OmpRuntime {
   readonly starts: OmpStartOptions[] = [];
   readonly sessionIds: string[] = [];
   nextModel: OmpModel | null = null;
-  nextThinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null = null;
+  nextThinkingLevel: string | null = null;
   nextInheritedRedactionValues: readonly string[] = [];
   omitNextThinkingLevel = false;
   nextCloseError: Error | null = null;
@@ -1885,6 +1884,244 @@ describe("OMP direct provider", () => {
     expect("defaultThinkingOption" in event.catalog).toBe(false);
     await connection.close();
   });
+  test("accepts bounded future model and state metadata from RPC", async () => {
+    const futureModel = {
+      provider: "future-provider",
+      id: "future-model",
+      name: 42,
+      reasoning: true,
+      thinking: {
+        efforts: ["low", 42, "x".repeat(33), "high", ...Array(20).fill("medium")],
+        defaultLevel: { future: true },
+      },
+      input: ["text", 42, "x".repeat(257), "image", ...Array(20).fill("audio")],
+      contextWindow: "large",
+    };
+    const futureCatalog = [
+      ...Array.from({ length: 600 }, (_, index) => ({
+        provider: "provider",
+        id: `model-${index}`,
+      })),
+      futureModel,
+    ];
+    let child: ProviderRpcChild;
+    const runtime = new OmpRpcRuntime({
+      spawnProcess() {
+        child = new ProviderRpcChild((command) => {
+          child.write({
+            type: "response",
+            id: command.id,
+            success: true,
+            data:
+              command.type === "negotiate_protocol"
+                ? { protocolVersion: 2 }
+                : command.type === "get_available_models"
+                  ? { models: futureCatalog }
+                  : {
+                      model: futureModel,
+                      thinkingLevel: "future-thinking",
+                      isStreaming: false,
+                      isCompacting: false,
+                      sessionId: NATIVE_SESSION_ID,
+                    },
+          });
+        });
+        queueMicrotask(() =>
+          child.write({
+            type: "ready",
+            protocolVersion: 1,
+            supportedProtocolVersions: [1, 2],
+            maxFrameBytes: 1_048_576,
+            maxReassembledFrameBytes: 67_108_864,
+          }),
+        );
+        return child.asChildProcess();
+      },
+      terminateProcessTree: () => Promise.resolve(true),
+      environment: TEST_RUNTIME_ENV,
+    });
+    const session = await runtime.startSession({
+      cwd: "/repo",
+      environment: TEST_RUNTIME_ENV,
+      noSession: true,
+    });
+    const [models, state] = await Promise.all([session.getAvailableModels(), session.getState()]);
+
+    expect(models).toHaveLength(601);
+    expect(models.at(-1)).toEqual({
+      provider: "future-provider",
+      id: "future-model",
+      reasoning: true,
+      thinking: {
+        efforts: ["low", "high", ...Array(14).fill("medium")],
+      },
+      input: ["text", "image", ...Array(14).fill("audio")],
+    });
+    expect(state).toMatchObject({
+      model: models.at(-1),
+      thinkingLevel: "future-thinking",
+      isStreaming: false,
+      isCompacting: false,
+      sessionId: NATIVE_SESSION_ID,
+    });
+    await session.close();
+  });
+
+  test("rejects model 257 during initial session open", async () => {
+    const hiddenModel: OmpModel = { provider: "future-provider", id: "hidden-model" };
+    const runtime = new FakeOmpRuntime();
+    runtime.availableModels = [
+      MODEL,
+      ...Array.from(
+        { length: 255 },
+        (_, index): OmpModel => ({ provider: "provider", id: `model-${index}` }),
+      ),
+      hiddenModel,
+    ];
+    const { connection, events } = await createHarness(runtime);
+
+    await connection.send({
+      type: "session.open",
+      requestId: "hidden-model-open",
+      sessionId: "hidden-model-session",
+      config: {
+        cwd: "/repo",
+        env: {},
+        mcpServers: {},
+        model: ompModelId(hiddenModel),
+        mode: "full",
+        settings: {},
+        persist: false,
+      },
+      history: "skip",
+    });
+    const failure = await events.waitFor(
+      (event) => event.type === "request.failed" && event.requestId === "hidden-model-open",
+    );
+
+    expect(failure).toEqual(
+      expect.objectContaining({
+        error: { message: "OMP model is not advertised by the configured session runtime" },
+      }),
+    );
+    expect(sessionAt(runtime).modelChanges).toEqual([]);
+    expect(events.some((event) => event.type === "session.ready")).toBe(false);
+    await connection.close();
+  });
+
+  test("rebuilds a bounded public catalog when fallback selects model 257", async () => {
+    const runtime = new FakeOmpRuntime();
+    const fallbackModel: OmpModel = {
+      provider: "future-provider",
+      id: "fallback-model",
+      reasoning: true,
+      thinking: { efforts: ["low", "high"], defaultLevel: "high" },
+    };
+    runtime.availableModels = [
+      MODEL,
+      ...Array.from(
+        { length: 255 },
+        (_, index): OmpModel => ({ provider: "provider", id: `model-${index}` }),
+      ),
+      fallbackModel,
+    ];
+    const { connection, events } = await createHarness(runtime);
+    await openSession(
+      connection,
+      events,
+      "oversized-catalog-open",
+      "oversized-catalog-session",
+      {},
+      MODEL_PUBLIC_ID,
+      null,
+      true,
+    );
+
+    const initialConfig = events.findLast((event) => event.type === "session.config");
+    if (initialConfig?.type !== "session.config") throw new Error("Expected session config");
+    expect(initialConfig.config.models).toHaveLength(256);
+    expect(
+      initialConfig.config.models.some((model) => model.id === ompModelId(fallbackModel)),
+    ).toBe(false);
+
+    await connection.send({
+      type: "session.configure",
+      requestId: "select-hidden-model",
+      sessionId: "oversized-catalog-session",
+      changes: { model: ompModelId(fallbackModel) },
+    });
+    await events.waitFor(
+      (event) => event.type === "request.failed" && event.requestId === "select-hidden-model",
+    );
+    expect(sessionAt(runtime).modelChanges).toEqual([]);
+
+    const refreshed = events.waitFor(
+      (event) =>
+        event.type === "session.config" && event.config.model === ompModelId(fallbackModel),
+    );
+    const session = sessionAt(runtime);
+    session.currentModel = fallbackModel;
+    session.thinkingLevel = "high";
+    session.emit({ type: "retry_fallback_succeeded", model: "future", role: "default" });
+    const fallbackConfig = await refreshed;
+    if (fallbackConfig.type !== "session.config") throw new Error("Expected fallback config");
+    expect(fallbackConfig.config.models).toHaveLength(256);
+    expect(
+      fallbackConfig.config.models.some((model) => model.id === ompModelId(fallbackModel)),
+    ).toBe(true);
+    expect(session.closes).toBe(0);
+    session.emit({ type: "process_exit", error: "fallback runtime exited" });
+    runtime.nextModel = fallbackModel;
+    runtime.nextThinkingLevel = "high";
+    const turnId = turnIdFrom(
+      await startPrompt(
+        connection,
+        events,
+        "fallback-257-recovery",
+        "continue",
+        "oversized-catalog-session",
+      ),
+    );
+    expect(runtime.starts[1]).toEqual(
+      expect.objectContaining({
+        model: undefined,
+        thinkingOption: undefined,
+        resumeSessionId: NATIVE_SESSION_ID,
+      }),
+    );
+    const recoveredConfig = events.findLast((event) => event.type === "session.config");
+    if (recoveredConfig?.type !== "session.config") throw new Error("Expected recovered config");
+    expect(recoveredConfig.config.models).toHaveLength(256);
+    expect(
+      recoveredConfig.config.models.some((model) => model.id === ompModelId(fallbackModel)),
+    ).toBe(true);
+    await finishTurn(events, sessionAt(runtime, 1), turnId);
+    await connection.close();
+  });
+
+  test("rejects a duplicate model identity at catalog entry 257", async () => {
+    const runtime = new FakeOmpRuntime();
+    const first: OmpModel = { provider: "provider", id: "model-0" };
+    runtime.availableModels = [
+      first,
+      ...Array.from(
+        { length: 255 },
+        (_, index): OmpModel => ({ provider: "provider", id: `model-${index + 1}` }),
+      ),
+      { ...first },
+    ];
+    const { connection, events } = await createHarness(runtime);
+
+    await connection.send({ type: "catalog", requestId: "duplicate-257", cwd: "/repo" });
+    await expect(
+      events.waitFor(
+        (event) => event.type === "request.failed" && event.requestId === "duplicate-257",
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({ error: { message: expect.stringContaining("diagnostic") } }),
+    );
+    await connection.close();
+  });
 
   test("blocks repeated catalog discovery after unverified cleanup", async () => {
     const runtime = new FakeOmpRuntime();
@@ -2081,7 +2318,7 @@ describe("OMP direct provider", () => {
       expect.objectContaining({
         cwd: "/repo",
         mode: "full",
-        thinkingOption: "medium",
+        thinkingOption: undefined,
         systemPrompt: "Be precise",
       }),
     );
@@ -2669,6 +2906,68 @@ describe("OMP direct provider", () => {
       expect.objectContaining({ error: { message: "OMP conversation rewind token is stale" } }),
     );
     expect(session.branches).toEqual(["entry-user-2"]);
+    await connection.close();
+  });
+
+  test("does not restore unadvertised thinking after rewind", async () => {
+    const history = [
+      { role: "user" as const, entryId: "rewind-user", content: "before" },
+      { role: "assistant" as const, entryId: "rewind-assistant", content: "reply" },
+    ];
+    const runtime = new FakeOmpRuntime();
+    runtime.descriptors.push({ id: NATIVE_SESSION_ID, cwd: "/repo" });
+    runtime.nextHistoryMessages = history;
+    const { connection, events } = await createHarness(runtime, new ManualScheduler(), [
+      "prompt.message",
+      "session.persistence",
+      "session.revert.conversation",
+    ]);
+    await connection.send({
+      type: "session.open",
+      requestId: "unsupported-thinking-rewind-open",
+      sessionId: "unsupported-thinking-rewind-session",
+      config: {
+        cwd: "/repo",
+        env: {},
+        mcpServers: {},
+        mode: "full",
+        settings: {},
+        persist: true,
+      },
+      persistence: { version: 1, data: { sessionId: NATIVE_SESSION_ID } },
+      history: "replay",
+    });
+    await events.waitFor(
+      (event) =>
+        event.type === "session.ready" && event.requestId === "unsupported-thinking-rewind-open",
+    );
+    const target = events.find(
+      (event) => event.type === "timeline.item" && event.item.type === "user_message",
+    );
+    if (target?.type !== "timeline.item" || target.item.type !== "user_message") {
+      throw new Error("Missing rewind target");
+    }
+    const session = sessionAt(runtime);
+    session.thinkingLevel = "max";
+    session.branchMessages = [{ entryId: "rewind-user", text: "before" }];
+    session.branchHistoryAfter = history;
+    session.branchThinkingAfter = "high";
+
+    await connection.send({
+      type: "session.revert",
+      requestId: "unsupported-thinking-rewind",
+      sessionId: "unsupported-thinking-rewind-session",
+      token: target.item.revertToken ?? null,
+      scope: "conversation",
+    });
+    await expect(
+      events.waitFor(
+        (event) =>
+          event.type === "request.completed" && event.requestId === "unsupported-thinking-rewind",
+      ),
+    ).resolves.toEqual({ type: "request.completed", requestId: "unsupported-thinking-rewind" });
+    expect(session.thinkingChanges).not.toContain("max");
+    expect(session.thinkingLevel).toBe("high");
     await connection.close();
   });
 
@@ -3571,7 +3870,7 @@ describe("OMP direct provider", () => {
     await connection.close();
   });
 
-  test("ignores stale resume thinking and rejects unsupported restored thinking", async () => {
+  test("opens restored sessions while omitting unsupported current thinking", async () => {
     const runtime = new FakeOmpRuntime();
     runtime.descriptors.push({ id: NATIVE_SESSION_ID, cwd: "/repo" });
     runtime.nextThinkingLevel = "max";
@@ -3595,17 +3894,19 @@ describe("OMP direct provider", () => {
       persistence: { version: 1, data: { sessionId: NATIVE_SESSION_ID } },
       history: "replay",
     });
-    const failure = await events.waitFor(
+    await events.waitFor(
       (event) =>
-        event.type === "request.failed" && event.requestId === "unsupported-restored-thinking",
+        event.type === "session.ready" && event.requestId === "unsupported-restored-thinking",
     );
-    expect(failure).toEqual(
-      expect.objectContaining({
-        error: { message: "OMP runtime selected an unsupported thinking level" },
-      }),
-    );
+    const config = events.findLast((event) => event.type === "session.config");
+    if (config?.type !== "session.config") throw new Error("Expected session config");
+    expect(config.config.thinkingOption).toBeUndefined();
     expect(runtime.starts[0]?.thinkingOption).toBeUndefined();
-    expect(events.some((event) => event.type === "session.ready")).toBe(false);
+    expect(events).toContainEqual({
+      type: "session.notice",
+      sessionId: "unsupported-restored-thinking-session",
+      notice: expect.objectContaining({ id: "omp:unsupported-thinking-level" }),
+    });
     await connection.close();
   });
 
@@ -4900,8 +5201,38 @@ describe("OMP direct provider", () => {
         error: { message: "OMP thinking level is unavailable for the selected model" },
       }),
     );
+    expect(runtime.starts[0]?.thinkingOption).toBeUndefined();
+    expect(sessionAt(runtime).thinkingChanges).toEqual([]);
     expect(events.some((event) => event.type === "session.ready")).toBe(false);
     expect(sessionAt(runtime).closes).toBe(1);
+    await connection.close();
+  });
+  test("rejects unknown startup thinking without sending it to OMP", async () => {
+    const runtime = new FakeOmpRuntime();
+    runtime.nextModel = ALTERNATE_MODEL;
+    const { connection, events } = await createHarness(runtime);
+
+    await connection.send({
+      type: "session.open",
+      requestId: "unknown-thinking-open",
+      sessionId: "unknown-thinking-session",
+      config: {
+        cwd: "/repo",
+        env: {},
+        mcpServers: {},
+        model: ALTERNATE_MODEL_PUBLIC_ID,
+        mode: "full",
+        thinkingOption: "future-thinking",
+        settings: {},
+        persist: false,
+      },
+      history: "skip",
+    });
+    await events.waitFor(
+      (event) => event.type === "request.failed" && event.requestId === "unknown-thinking-open",
+    );
+    expect(runtime.starts[0]?.thinkingOption).toBeUndefined();
+    expect(sessionAt(runtime).thinkingChanges).toEqual([]);
     await connection.close();
   });
 
@@ -6182,21 +6513,28 @@ describe("OMP direct provider", () => {
     await connection.close();
   });
 
-  test("invalidates runtime state with a thinking level outside the model catalog", async () => {
+  test("omits unsupported thinking when refreshing runtime state", async () => {
     const { connection, events, runtime } = await createHarness();
     await openSession(connection, events);
     const session = sessionAt(runtime);
-    const baselineConfigs = events.filter((event) => event.type === "session.config").length;
-    const closed = Promise.withResolvers<void>();
-    session.closeObserved = closed.resolve;
     session.currentModel = ALTERNATE_MODEL;
     session.thinkingLevel = "medium";
 
+    const refreshed = events.waitFor(
+      (event) =>
+        event.type === "session.config" && event.config.model === ALTERNATE_MODEL_PUBLIC_ID,
+    );
     session.emit({ type: "model_changed" });
-    await closed.promise;
+    const config = await refreshed;
 
-    expect(session.closes).toBe(1);
-    expect(events.filter((event) => event.type === "session.config")).toHaveLength(baselineConfigs);
+    if (config.type !== "session.config") throw new Error("Expected session config");
+    expect(config.config.thinkingOption).toBeUndefined();
+    expect(session.closes).toBe(0);
+    expect(events).toContainEqual({
+      type: "session.notice",
+      sessionId: "session-1",
+      notice: expect.objectContaining({ id: "omp:unsupported-thinking-level" }),
+    });
     await connection.close();
   });
 
