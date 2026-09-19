@@ -21,13 +21,15 @@ import { OmpTimelineProjector, type OmpTimelineScheduler } from "./timeline-proj
 
 const MAX_CHILDREN = 1_024;
 const MAX_TASK_DISPATCHES = 4_096;
-const MAX_BUFFERED_EVENTS = 1_024;
+const MAX_BUFFERED_EVENTS = MAX_CHILDREN * 3;
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const MAX_CHILD_MESSAGE_IDENTITIES = 2_048;
 const MAX_REPLAY_MESSAGES = 100_000;
 const MAX_REPLAY_BYTES = 64 * 1024 * 1024;
 const MAX_REPLAY_NODES = 400_000;
 const MAX_REPLAY_DEPTH = 16;
+const CHILD_REPLAY_UNAVAILABLE = "OMP subagent history is unavailable or incomplete";
+type BufferedSubagentEvent = { event: OmpSubagentEvent; bytes: number };
 
 type Emit = (event: ProviderEvent) => void;
 type ChildTerminalStatus = "completed" | "failed" | "canceled";
@@ -53,6 +55,7 @@ type ChildState = {
   status: ChildStatus;
   terminalRequested?: ChildTerminalStatus;
   sessionClosed: boolean;
+  replayUnavailable?: boolean;
   seenInSnapshot: boolean;
   seenAssistantIdentities: BoundedStringSet;
   projector: OmpTimelineProjector;
@@ -63,6 +66,7 @@ type TaskDispatch = {
   childSessionIds: Set<string>;
   acknowledged: boolean;
 };
+type ReplayHistory = { sessionFile: string; messages: OmpMessage[] };
 type ReplayBudget = { messages: number; bytes: number; nodes: number };
 const TaskArgsSchema = z.object({
   tasks: z.array(z.unknown()).max(MAX_CHILDREN).optional(),
@@ -302,12 +306,18 @@ function terminalStatus(status: string): ChildTerminalStatus | undefined {
   return;
 }
 
+function bufferedNativeId(event: OmpSubagentEvent): string {
+  return event.type === "subagent_progress" ? event.payload.progress.id : event.payload.id;
+}
+
 export class OmpSubsessionProjector {
   private readonly children = new Map<string, ChildState>();
   private readonly sessionIdByNativeId = new Map<string, string>();
   private readonly toolOwners = new Map<string, string>();
   private readonly dispatches = new Map<string, TaskDispatch>();
-  private readonly bufferedEvents: OmpSubagentEvent[] = [];
+  private readonly bufferedEvents: BufferedSubagentEvent[] = [];
+  // null means every child observed during this replay is omitted after tombstone saturation.
+  private omittedBufferedChildren: Set<string> | null = new Set();
   private bufferedBytes = 0;
   private replaying = false;
   private closed = false;
@@ -374,15 +384,7 @@ export class OmpSubsessionProjector {
   handle(event: OmpSubagentEvent): void {
     if (this.closed) return;
     if (this.replaying) {
-      if (this.bufferedEvents.length >= MAX_BUFFERED_EVENTS) {
-        throw new OmpPublicError("OMP subagent replay event limit reached");
-      }
-      const bytes = boundedJsonBytes(event, MAX_BUFFERED_BYTES, 1_024, MAX_BUFFERED_BYTES, 4_096);
-      if (bytes === Number.POSITIVE_INFINITY || this.bufferedBytes + bytes > MAX_BUFFERED_BYTES) {
-        throw new OmpPublicError("OMP subagent replay event limit reached");
-      }
-      this.bufferedEvents.push(event);
-      this.bufferedBytes += bytes;
+      this.bufferEvent(event);
       return;
     }
     this.apply(event);
@@ -409,23 +411,48 @@ export class OmpSubsessionProjector {
         signal,
         0,
       );
-      const snapshots = await waitForReplay(runtimeSession.getSubagents(), signal);
+      let snapshots: OmpSubagentSnapshot[] = [];
+      try {
+        snapshots = await waitForReplay(runtimeSession.getSubagents(), signal);
+      } catch (error) {
+        if (signal.aborted) throw error;
+      }
       await this.replaySnapshots(snapshots, runtimeSession, runtime, visited, budget, signal);
       signal.throwIfAborted();
       this.reconcileSnapshots(snapshots);
+      completed = true;
+    } catch (error) {
+      if (signal.aborted) throw error;
+      this.terminalize("failed");
       completed = true;
     } finally {
       this.replaying = false;
       const buffered = this.bufferedEvents.splice(0);
       this.bufferedBytes = 0;
       if (completed && !signal.aborted) {
-        for (const event of buffered) this.apply(event);
+        for (const { event } of buffered) {
+          if (
+            event.type === "subagent_progress" &&
+            !terminalStatus(event.payload.progress.status)
+          ) {
+            const sessionId = this.sessionIdByNativeId.get(event.payload.progress.id);
+            const child = sessionId ? this.children.get(sessionId) : undefined;
+            if (child && child.status !== "running") continue;
+          }
+          try {
+            this.apply(event);
+          } catch {
+            this.terminalize("failed");
+          }
+        }
       } else {
+        this.terminalize("failed");
         this.closed = true;
         for (const child of this.children.values()) child.projector.close();
         this.dispatches.clear();
         this.toolOwners.clear();
       }
+      this.omittedBufferedChildren = new Set();
     }
   }
 
@@ -460,6 +487,126 @@ export class OmpSubsessionProjector {
     }
     this.bufferedEvents.length = 0;
     this.bufferedBytes = 0;
+    this.omittedBufferedChildren = new Set();
+  }
+
+  private bufferEvent(event: OmpSubagentEvent): void {
+    const isProgress = event.type === "subagent_progress";
+    const progressTerminal = isProgress ? terminalStatus(event.payload.progress.status) : undefined;
+    const isAdvisoryProgress = isProgress && !progressTerminal;
+    const bufferedEvent: OmpSubagentEvent =
+      isProgress && progressTerminal
+        ? {
+            type: "subagent_lifecycle",
+            payload: {
+              id: event.payload.progress.id,
+              agent: event.payload.agent,
+              status: event.payload.progress.status,
+              index: event.payload.index,
+              ...(event.payload.agentSource ? { agentSource: event.payload.agentSource } : {}),
+              ...(event.payload.parentToolCallId
+                ? { parentToolCallId: event.payload.parentToolCallId }
+                : {}),
+              ...(event.payload.detached !== undefined ? { detached: event.payload.detached } : {}),
+            },
+          }
+        : event;
+    const incomingId = bufferedNativeId(bufferedEvent);
+    if (this.isBufferedChildOmitted(incomingId)) return;
+    const bytes = boundedJsonBytes(
+      bufferedEvent,
+      MAX_BUFFERED_BYTES,
+      1_024,
+      MAX_BUFFERED_BYTES,
+      4_096,
+    );
+    if (bytes === Number.POSITIVE_INFINITY) {
+      if (!isAdvisoryProgress) this.omitBufferedChild(incomingId);
+      return;
+    }
+    if (isAdvisoryProgress) {
+      for (let index = this.bufferedEvents.length - 1; index >= 0; index -= 1) {
+        const queued = this.bufferedEvents[index]?.event;
+        if (!queued) continue;
+        if (
+          queued.type === "subagent_lifecycle" &&
+          queued.payload.id === incomingId &&
+          terminalStatus(queued.payload.status)
+        ) {
+          return;
+        }
+        if (queued.type !== "subagent_progress" || queued.payload.progress.id !== incomingId) {
+          continue;
+        }
+        if (terminalStatus(queued.payload.progress.status)) return;
+        const [removed] = this.bufferedEvents.splice(index, 1);
+        this.bufferedBytes -= removed?.bytes ?? 0;
+        break;
+      }
+    }
+
+    const bufferedIds = new Set<string>();
+    for (const child of this.children.values()) bufferedIds.add(child.nativeId);
+    for (const { event: queued } of this.bufferedEvents) bufferedIds.add(bufferedNativeId(queued));
+    if (!bufferedIds.has(incomingId) && bufferedIds.size >= MAX_CHILDREN) {
+      if (isAdvisoryProgress) return;
+      const advisory = this.bufferedEvents.find(
+        ({ event: queued }) =>
+          queued.type === "subagent_progress" && !terminalStatus(queued.payload.progress.status),
+      );
+      if (!advisory) {
+        this.omitBufferedChild(incomingId);
+        return;
+      }
+      const evictedId = bufferedNativeId(advisory.event);
+      this.omitBufferedChild(evictedId);
+      if (this.isBufferedChildOmitted(incomingId)) return;
+    }
+
+    while (
+      this.bufferedEvents.length >= MAX_BUFFERED_EVENTS ||
+      this.bufferedBytes + bytes > MAX_BUFFERED_BYTES
+    ) {
+      const advisoryIndex = this.bufferedEvents.findIndex(
+        ({ event: queued }) =>
+          queued.type === "subagent_progress" && !terminalStatus(queued.payload.progress.status),
+      );
+      if (advisoryIndex < 0) {
+        if (!isAdvisoryProgress) this.omitBufferedChild(incomingId);
+        return;
+      }
+      const [removed] = this.bufferedEvents.splice(advisoryIndex, 1);
+      this.bufferedBytes -= removed?.bytes ?? 0;
+    }
+    this.bufferedEvents.push({ event: bufferedEvent, bytes });
+    this.bufferedBytes += bytes;
+  }
+
+  private isBufferedChildOmitted(nativeId: string): boolean {
+    return this.omittedBufferedChildren === null || this.omittedBufferedChildren.has(nativeId);
+  }
+
+  private omitBufferedChild(nativeId: string): void {
+    const omitted = this.omittedBufferedChildren;
+    if (!omitted || omitted.has(nativeId)) return;
+    if (omitted.size >= MAX_CHILDREN) {
+      this.omittedBufferedChildren = null;
+      this.bufferedEvents.length = 0;
+      this.bufferedBytes = 0;
+      for (const child of this.children.values()) child.replayUnavailable = true;
+      this.terminalize("failed");
+      return;
+    }
+    omitted.add(nativeId);
+    for (let index = this.bufferedEvents.length - 1; index >= 0; index -= 1) {
+      const queued = this.bufferedEvents[index];
+      if (!queued || bufferedNativeId(queued.event) !== nativeId) continue;
+      const [removed] = this.bufferedEvents.splice(index, 1);
+      this.bufferedBytes -= removed?.bytes ?? 0;
+    }
+    const sessionId = this.sessionIdByNativeId.get(nativeId);
+    const child = sessionId ? this.children.get(sessionId) : undefined;
+    if (child?.status === "running") this.failReplayChild(child);
   }
 
   private apply(event: OmpSubagentEvent): void {
@@ -587,6 +734,7 @@ export class OmpSubsessionProjector {
   }
 
   private restartChild(child: ChildState): void {
+    child.replayUnavailable = false;
     if (child.status === "running") return;
     child.status = "running";
     child.terminalRequested = undefined;
@@ -607,7 +755,12 @@ export class OmpSubsessionProjector {
     if (!this.hasDirectActivity(child.sessionId)) this.finishChild(child, status);
   }
 
-  private finishChild(child: ChildState, status: ChildTerminalStatus, force = false): void {
+  private finishChild(
+    child: ChildState,
+    status: ChildTerminalStatus,
+    force = false,
+    errorMessage = "OMP subagent failed",
+  ): void {
     if (child.status !== "running") return;
     if (!force && this.hasDirectActivity(child.sessionId)) {
       child.terminalRequested = status;
@@ -620,7 +773,7 @@ export class OmpSubsessionProjector {
       sessionId: child.sessionId,
       turnId: child.turnId,
       state: status,
-      ...(status === "failed" ? { error: { message: "OMP subagent failed" } } : {}),
+      ...(status === "failed" ? { error: { message: errorMessage } } : {}),
     });
     for (const [toolCallId, dispatch] of this.dispatches) {
       if (dispatch.childSessionIds.has(child.sessionId)) this.settleDispatch(toolCallId, dispatch);
@@ -630,6 +783,10 @@ export class OmpSubsessionProjector {
       this.finishChild(parent, parent.terminalRequested);
     }
     this.onActivityChange();
+  }
+  private failReplayChild(child: ChildState): void {
+    child.replayUnavailable = true;
+    this.finishChild(child, "failed", true, CHILD_REPLAY_UNAVAILABLE);
   }
 
   private hasDirectActivity(ownerSessionId: string): boolean {
@@ -691,6 +848,10 @@ export class OmpSubsessionProjector {
         this.resolveParent(snapshot.parentToolCallId, snapshot.sessionFile),
       );
       present.add(child.nativeId);
+      if (child.replayUnavailable) {
+        child.seenInSnapshot = true;
+        continue;
+      }
       const terminal = terminalStatus(snapshot.status);
       if (terminal) this.requestTerminal(child, terminal);
       else this.restartChild(child);
@@ -712,36 +873,75 @@ export class OmpSubsessionProjector {
     budget: ReplayBudget,
     signal: AbortSignal,
   ): Promise<void> {
-    const ordered = [...snapshots].sort(
-      (left, right) =>
-        (left.sessionFile?.split("/").length ?? 0) - (right.sessionFile?.split("/").length ?? 0),
-    );
-    for (const snapshot of ordered) {
+    const collected: Array<{
+      snapshot: OmpSubagentSnapshot;
+      sessionFile?: string;
+      messages?: OmpMessage[];
+    }> = [];
+    for (const snapshot of snapshots) {
       signal.throwIfAborted();
       if (this.sessionIdByNativeId.has(snapshot.id)) continue;
-      const history = await waitForReplay(
-        runtimeSession.getSubagentMessages({ subagentId: snapshot.id }),
-        signal,
-      );
-      this.accountReplay(history.messages, budget, signal);
+      try {
+        const history = await waitForReplay(
+          runtimeSession.getSubagentMessages({ subagentId: snapshot.id }),
+          signal,
+        );
+        try {
+          this.accountReplay(history.messages, budget, signal);
+          collected.push({
+            snapshot,
+            sessionFile: history.sessionFile,
+            messages: history.messages,
+          });
+        } catch (error) {
+          if (signal.aborted) throw error;
+          collected.push({ snapshot, sessionFile: history.sessionFile });
+        }
+      } catch (error) {
+        if (signal.aborted) throw error;
+        collected.push({ snapshot });
+      }
+    }
+    collected.sort((left, right) => {
+      const leftDepth = left.sessionFile?.split("/").length ?? Number.MAX_SAFE_INTEGER;
+      const rightDepth = right.sessionFile?.split("/").length ?? Number.MAX_SAFE_INTEGER;
+      return leftDepth - rightDepth;
+    });
+    const snapshotIds = new Set(collected.map(({ snapshot }) => snapshot.id));
+    for (const { snapshot, sessionFile, messages } of collected) {
       signal.throwIfAborted();
-      const parentSessionId = this.resolveParent(snapshot.parentToolCallId, history.sessionFile);
-      const child = this.ensureChild(
-        { ...snapshot, sessionFile: history.sessionFile },
-        parentSessionId,
-      );
-      this.projectReplay(child, history.messages, signal);
-      visited.add(`${history.sessionFile}\0${snapshot.id}`);
-      await this.replayChildren(
-        child.sessionId,
-        history.sessionFile,
-        history.messages,
-        runtime,
-        visited,
-        budget,
-        signal,
-        1,
-      );
+      if (this.sessionIdByNativeId.has(snapshot.id)) continue;
+      let child: ChildState | undefined;
+      try {
+        child = this.ensureChild(
+          { ...snapshot, sessionFile },
+          this.resolveParent(snapshot.parentToolCallId, sessionFile),
+        );
+        if (!messages || this.isBufferedChildOmitted(snapshot.id)) {
+          this.failReplayChild(child);
+          continue;
+        }
+        this.projectReplay(child, messages, signal);
+        if (!sessionFile) {
+          this.failReplayChild(child);
+          continue;
+        }
+        visited.add(`${sessionFile}\0${snapshot.id}`);
+        await this.replayChildren(
+          child.sessionId,
+          sessionFile,
+          messages,
+          runtime,
+          visited,
+          budget,
+          signal,
+          1,
+          snapshotIds,
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (child) this.failReplayChild(child);
+      }
     }
     const activeToolCallIds = new Set(
       snapshots.flatMap((snapshot) =>
@@ -764,46 +964,64 @@ export class OmpSubsessionProjector {
     budget: ReplayBudget,
     signal: AbortSignal,
     depth: number,
+    snapshotIds?: ReadonlySet<string>,
   ): Promise<void> {
     signal.throwIfAborted();
     if (depth > MAX_REPLAY_DEPTH) throw new OmpPublicError("OMP subagent history is too deep");
     this.indexTaskCalls(parentSessionId, messages);
     for (const ref of replayChildren(messages)) {
       signal.throwIfAborted();
-      if (!parentSessionFile) {
-        throw new OmpPublicError("OMP parent transcript identity is unavailable");
-      }
+      if (!parentSessionFile || snapshotIds?.has(ref.id)) continue;
       const visitKey = `${parentSessionFile}\0${ref.id}`;
       if (visited.has(visitKey)) continue;
       visited.add(visitKey);
-      const history = await waitForReplay(
-        runtime.readPersistedSubagentTranscript({
-          parentSessionFile,
-          childTranscriptId: ref.id,
-          cwd: this.cwd,
+      let child: ChildState | undefined;
+      let history: ReplayHistory | undefined;
+      try {
+        const loaded = await waitForReplay(
+          runtime.readPersistedSubagentTranscript({
+            parentSessionFile,
+            childTranscriptId: ref.id,
+            cwd: this.cwd,
+            signal,
+          }),
           signal,
-        }),
-        signal,
-      );
-      this.accountReplay(history.messages, budget, signal);
-      signal.throwIfAborted();
-      const child = this.ensureChild({ ...ref, sessionFile: history.sessionFile }, parentSessionId);
-      this.projectReplay(child, history.messages, signal);
-      await this.replayChildren(
-        child.sessionId,
-        history.sessionFile,
-        history.messages,
-        runtime,
-        visited,
-        budget,
-        signal,
-        depth + 1,
-      );
-      signal.throwIfAborted();
-      this.requestTerminal(
-        child,
-        ref.status === "derive" ? replayTerminalStatus(history.messages) : ref.status,
-      );
+        );
+        history = loaded;
+        child = this.ensureChild({ ...ref, sessionFile: loaded.sessionFile }, parentSessionId);
+        this.accountReplay(loaded.messages, budget, signal);
+        signal.throwIfAborted();
+        this.projectReplay(child, loaded.messages, signal);
+        await this.replayChildren(
+          child.sessionId,
+          history.sessionFile,
+          history.messages,
+          runtime,
+          visited,
+          budget,
+          signal,
+          depth + 1,
+          snapshotIds,
+        );
+        signal.throwIfAborted();
+        this.requestTerminal(
+          child,
+          ref.status === "derive" ? replayTerminalStatus(history.messages) : ref.status,
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        if (!child) {
+          try {
+            child = this.ensureChild(
+              { ...ref, sessionFile: history?.sessionFile },
+              parentSessionId,
+            );
+          } catch {
+            continue;
+          }
+        }
+        this.failReplayChild(child);
+      }
     }
   }
 
