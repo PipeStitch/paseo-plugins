@@ -58,6 +58,7 @@ const MAX_CONNECTION_SESSIONS = 32;
 const MAX_ACTIVE_OPERATIONS = 128;
 const MAX_PROVIDER_INPUT_BYTES = 2 * 1024 * 1024;
 const MAX_NESTED_OPTION_BYTES = 256 * 1024;
+const MAX_ENV_ENTRIES = 256;
 const MAX_NATIVE_SESSION_RESERVATIONS = 256;
 
 function hasOwnEntries(value: unknown): boolean {
@@ -66,6 +67,19 @@ function hasOwnEntries(value: unknown): boolean {
     if (Object.hasOwn(value, key)) return true;
   }
   return false;
+}
+
+function providerOptionsExceedPreflightLimits(value: unknown): boolean {
+  if (
+    boundedJsonBytes(value, MAX_NESTED_OPTION_BYTES, MAX_ENV_ENTRIES) === Number.POSITIVE_INFINITY
+  ) {
+    return true;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const unrelatedOptions = Object.fromEntries(
+    Object.entries(value).filter(([key]) => key !== "env" && key !== "inheritEnv"),
+  );
+  return boundedJsonBytes(unrelatedOptions, MAX_NESTED_OPTION_BYTES) === Number.POSITIVE_INFINITY;
 }
 
 function preflightProviderInput(input: unknown): void {
@@ -82,7 +96,16 @@ function preflightProviderInput(input: unknown): void {
       throw new OmpPublicError("Session persistence input is too large");
     }
     const config = record.config as Record<string, unknown> | undefined;
-    for (const value of [config?.mcpServers, config?.providerOptions, config?.settings]) {
+    if (
+      (config?.env !== undefined &&
+        boundedJsonBytes(config.env, MAX_NESTED_OPTION_BYTES, MAX_ENV_ENTRIES) ===
+          Number.POSITIVE_INFINITY) ||
+      (config?.providerOptions !== undefined &&
+        providerOptionsExceedPreflightLimits(config.providerOptions))
+    ) {
+      throw new OmpPublicError("Session configuration is too large");
+    }
+    for (const value of [config?.mcpServers, config?.settings]) {
       if (
         value !== undefined &&
         boundedJsonBytes(value, MAX_NESTED_OPTION_BYTES) === Number.POSITIVE_INFINITY
@@ -109,13 +132,17 @@ function preflightProviderInput(input: unknown): void {
     }
   }
   if (record.type === "catalog" || record.type === "sessions") {
-    for (const value of [record.providerOptions, record.settings]) {
-      if (
-        value !== undefined &&
-        boundedJsonBytes(value, MAX_NESTED_OPTION_BYTES) === Number.POSITIVE_INFINITY
-      ) {
-        throw new OmpPublicError("Provider configuration is too large");
-      }
+    if (
+      record.providerOptions !== undefined &&
+      providerOptionsExceedPreflightLimits(record.providerOptions)
+    ) {
+      throw new OmpPublicError("Provider configuration is too large");
+    }
+    if (
+      record.settings !== undefined &&
+      boundedJsonBytes(record.settings, MAX_NESTED_OPTION_BYTES) === Number.POSITIVE_INFINITY
+    ) {
+      throw new OmpPublicError("Provider configuration is too large");
     }
   }
   if (record.type === "session.prompt") {
