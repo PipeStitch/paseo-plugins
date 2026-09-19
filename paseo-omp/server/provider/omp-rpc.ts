@@ -4,7 +4,13 @@ import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { ompDataDir } from "../paths";
 import { isValidImagePayload } from "./image";
-import { boundedJsonBytes, OmpCleanupFailure, OmpPublicError, utf8Bytes } from "./security";
+import {
+  boundedJsonBytes,
+  boundedJsonMetrics,
+  OmpCleanupFailure,
+  OmpPublicError,
+  utf8Bytes,
+} from "./security";
 import {
   listOmpSessionDescriptors,
   type OmpSessionDescriptor,
@@ -56,6 +62,14 @@ const MAX_PENDING_ONE_WAY_WRITES = 256;
 const MAX_PENDING_WRITE_BYTES = 8 * 1024 * 1024;
 const MAX_LINE_PARTS = 4_096;
 const MAX_ARRAY_ITEMS = 512;
+// OMP read metadata can contain one source entry per displayed line. Bound this optional,
+// opaque field separately so over-budget metadata can be omitted without losing completion events.
+const MAX_OPTIONAL_METADATA_BYTES = MAX_TOOL_PAYLOAD_LENGTH;
+const MAX_OPTIONAL_METADATA_ITEMS = 2_048;
+const MAX_OPTIONAL_METADATA_NODES = 4_096;
+const MAX_TASK_CORRELATION_BYTES = 256 * 1024;
+const MAX_TASK_CORRELATION_ITEMS = 1_024;
+const MAX_TASK_CORRELATION_NODES = 4_096;
 // Tool-intensive OMP turns legitimately exceed 64 blocks; transport byte/node budgets remain the
 // primary resource bounds.
 export const OMP_MAX_CONTENT_PARTS = 4_096;
@@ -118,6 +132,148 @@ function isBoundedJson(
     boundedJsonBytes(value, maxBytes, maxItems, maxBytes, maxNodes) !== Number.POSITIVE_INFINITY
   );
 }
+function optionalMetadataMetrics(value: unknown) {
+  return boundedJsonMetrics(
+    value,
+    MAX_OPTIONAL_METADATA_BYTES,
+    MAX_OPTIONAL_METADATA_ITEMS,
+    MAX_OPTIONAL_METADATA_BYTES,
+    MAX_OPTIONAL_METADATA_NODES,
+  );
+}
+
+function optionalMetadataIsBounded(value: unknown): boolean {
+  return optionalMetadataMetrics(value) !== undefined;
+}
+
+function omitUnsafeOptionalDetails(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (!Object.hasOwn(record, "details") || optionalMetadataIsBounded(record.details)) return value;
+  const { details: _details, ...safe } = record;
+  return safe;
+}
+
+const TASK_RESULT_STATUSES: Readonly<Record<string, true>> = {
+  pending: true,
+  running: true,
+  completed: true,
+  failed: true,
+  error: true,
+  aborted: true,
+  canceled: true,
+  cancelled: true,
+};
+const TASK_PROGRESS_STATUSES: Readonly<Record<string, true>> = {
+  pending: true,
+  running: true,
+  completed: true,
+  failed: true,
+  aborted: true,
+};
+
+function boundedTaskId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && utf8Bytes(value) <= MAX_ID_LENGTH;
+}
+
+function taskCorrelationDetails(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+  const details = value as Record<string, unknown>;
+  if (!Array.isArray(details.results) || details.results.length > MAX_TASK_CORRELATION_ITEMS)
+    return;
+  const results: Record<string, unknown>[] = [];
+  for (const value of details.results) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+    const result = value as Record<string, unknown>;
+    if (!boundedTaskId(result.id)) return;
+    const safe: Record<string, unknown> = { id: result.id };
+    if (typeof result.status === "string" && Object.hasOwn(TASK_RESULT_STATUSES, result.status)) {
+      safe.status = result.status;
+    }
+    if (typeof result.aborted === "boolean") safe.aborted = result.aborted;
+    if (typeof result.exitCode === "number" && Number.isFinite(result.exitCode)) {
+      safe.exitCode = result.exitCode;
+    }
+    if (
+      result.error !== undefined &&
+      boundedJsonMetrics(result.error, 4_096, 32, 4_096, 64) !== undefined
+    ) {
+      safe.error = result.error;
+    }
+    results.push(safe);
+  }
+  let progress: Record<string, unknown>[] | undefined;
+  if (details.progress !== undefined) {
+    if (!Array.isArray(details.progress) || details.progress.length > MAX_TASK_CORRELATION_ITEMS) {
+      return;
+    }
+    progress = [];
+    for (const value of details.progress) {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+      const item = value as Record<string, unknown>;
+      if (
+        !boundedTaskId(item.id) ||
+        typeof item.index !== "number" ||
+        !Number.isInteger(item.index) ||
+        item.index < 0 ||
+        item.index >= MAX_TASK_CORRELATION_ITEMS ||
+        typeof item.status !== "string" ||
+        !Object.hasOwn(TASK_PROGRESS_STATUSES, item.status)
+      ) {
+        return;
+      }
+      progress.push({ id: item.id, index: item.index, status: item.status });
+    }
+  }
+  const correlation = { results, ...(progress ? { progress } : {}) };
+  return boundedJsonMetrics(
+    correlation,
+    MAX_TASK_CORRELATION_BYTES,
+    MAX_TASK_CORRELATION_ITEMS,
+    MAX_TASK_CORRELATION_BYTES,
+    MAX_TASK_CORRELATION_NODES,
+  )
+    ? correlation
+    : undefined;
+}
+
+function omitOptionalDetails(value: unknown, preserveTaskCorrelation = false): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (!Object.hasOwn(record, "details")) return value;
+  const { details: _details, ...structural } = record;
+  if (!preserveTaskCorrelation) return structural;
+  const correlation = taskCorrelationDetails(record.details);
+  return correlation === undefined ? structural : { ...structural, details: correlation };
+}
+
+function createOptionalMetadataSanitizer(): (value: unknown, taskResult?: boolean) => unknown {
+  let retainedBytes = 0;
+  let retainedNodes = 0;
+  return (value, taskResult = false) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const record = value as Record<string, unknown>;
+    if (!Object.hasOwn(record, "details")) return value;
+    const metrics = optionalMetadataMetrics(record.details);
+    if (
+      metrics &&
+      retainedBytes + metrics.bytes <= MAX_OPTIONAL_METADATA_BYTES &&
+      retainedNodes + metrics.nodes <= MAX_OPTIONAL_METADATA_NODES
+    ) {
+      retainedBytes += metrics.bytes;
+      retainedNodes += metrics.nodes;
+      return value;
+    }
+    const correlation = taskResult ? taskCorrelationDetails(record.details) : undefined;
+    const { details: _details, ...safe } = record;
+    return correlation === undefined ? safe : { ...safe, details: correlation };
+  };
+}
+
+const OmpOptionalMetadataSchema = z.preprocess(
+  (value) => (optionalMetadataIsBounded(value) ? value : undefined),
+  z.unknown().optional(),
+);
 
 const OmpContentPartSchema = z
   .object({
@@ -165,10 +321,7 @@ const OmpMessageIdentityShape = {
   responseId: IDENTIFIER.optional(),
   images: OmpImageArraySchema.optional(),
   timestamp: z.number().finite().optional(),
-  details: z
-    .unknown()
-    .refine((value) => isBoundedJson(value, MAX_SEMANTIC_FRAME_BYTES, 1_024, 4_096))
-    .optional(),
+  details: OmpOptionalMetadataSchema,
 };
 type OmpContentPart = z.infer<typeof OmpContentPartSchema>;
 type OmpMessageIdentity = {
@@ -409,6 +562,16 @@ const JsonObjectSchema = z.record(z.string(), z.unknown());
 const BoundedToolPayloadSchema = z
   .unknown()
   .refine((value) => isBoundedJson(value, MAX_SEMANTIC_FRAME_BYTES, 1_024, 4_096));
+const OmpToolResultPayloadSchema = z.preprocess(
+  omitUnsafeOptionalDetails,
+  z
+    .unknown()
+    .refine(
+      (value) =>
+        isBoundedJson(value, MAX_SEMANTIC_FRAME_BYTES, MAX_OPTIONAL_METADATA_ITEMS, 8_192) &&
+        isBoundedJson(omitOptionalDetails(value), MAX_SEMANTIC_FRAME_BYTES, 1_024, 4_096),
+    ),
+);
 const OmpHostToolDefinitionSchema = z.object({
   name: NAME,
   label: NAME.optional(),
@@ -616,13 +779,13 @@ const OmpAgentSessionEventSchema = z.discriminatedUnion("type", [
     toolCallId: IDENTIFIER,
     toolName: NAME,
     args: BoundedToolPayloadSchema.optional(),
-    partialResult: BoundedToolPayloadSchema,
+    partialResult: OmpToolResultPayloadSchema,
   }),
   z.object({
     type: z.literal("tool_execution_end"),
     toolCallId: IDENTIFIER,
     toolName: NAME,
-    result: BoundedToolPayloadSchema,
+    result: OmpToolResultPayloadSchema,
     isError: z.boolean().optional(),
   }),
   OmpCompactionStartSchema,
@@ -873,6 +1036,102 @@ const OmpRuntimeEventSchema = z.discriminatedUnion("type", [
   OmpToolApprovalCancelSchema,
   z.object({ type: z.literal("advisor_yielded") }),
 ]);
+type OptionalDetailsMapper = (value: unknown, taskResult?: boolean) => unknown;
+
+function mapRecordField(
+  record: Record<string, unknown>,
+  key: string,
+  map: OptionalDetailsMapper,
+  taskResult = false,
+): Record<string, unknown> {
+  if (!Object.hasOwn(record, key)) return record;
+  const next = map(record[key], taskResult);
+  return next === record[key] ? record : { ...record, [key]: next };
+}
+
+function mapMessageList(value: unknown, map: OptionalDetailsMapper): unknown {
+  if (!Array.isArray(value)) return value;
+  let changed = false;
+  const messages = value.map((message) => {
+    const taskResult =
+      message !== null &&
+      typeof message === "object" &&
+      !Array.isArray(message) &&
+      (message as Record<string, unknown>).role === "toolResult" &&
+      (message as Record<string, unknown>).toolName === "task";
+    const next = map(message, taskResult);
+    changed ||= next !== message;
+    return next;
+  });
+  return changed ? messages : value;
+}
+
+function mapAgentEventDetails(
+  frame: Record<string, unknown>,
+  map: OptionalDetailsMapper,
+): Record<string, unknown> {
+  switch (frame.type) {
+    case "message_start":
+    case "message_update":
+    case "message_end": {
+      const message = frame.message;
+      const taskResult =
+        message !== null &&
+        typeof message === "object" &&
+        !Array.isArray(message) &&
+        (message as Record<string, unknown>).role === "toolResult" &&
+        (message as Record<string, unknown>).toolName === "task";
+      return mapRecordField(frame, "message", map, taskResult);
+    }
+    case "tool_execution_update":
+      return mapRecordField(frame, "partialResult", map, frame.toolName === "task");
+    case "tool_execution_end":
+      return mapRecordField(frame, "result", map, frame.toolName === "task");
+    case "agent_end":
+      return mapRecordField(frame, "messages", (messages) => mapMessageList(messages, map));
+    default:
+      return frame;
+  }
+}
+
+function mapRuntimeFrameDetails(
+  frame: Record<string, unknown>,
+  map: OptionalDetailsMapper,
+): Record<string, unknown> {
+  if (frame.type !== "subagent_event") return mapAgentEventDetails(frame, map);
+  if (frame.payload === null || typeof frame.payload !== "object" || Array.isArray(frame.payload)) {
+    return frame;
+  }
+  const payload = frame.payload as Record<string, unknown>;
+  if (payload.event === null || typeof payload.event !== "object" || Array.isArray(payload.event)) {
+    return frame;
+  }
+  const event = mapAgentEventDetails(payload.event as Record<string, unknown>, map);
+  return event === payload.event ? frame : { ...frame, payload: { ...payload, event } };
+}
+
+function sanitizeMessageListMetadata(value: unknown): unknown {
+  return mapMessageList(value, createOptionalMetadataSanitizer());
+}
+
+function sanitizeHistoryResponseData(value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  return mapRecordField(value as Record<string, unknown>, "messages", sanitizeMessageListMetadata);
+}
+
+function runtimeFrameCollectionLimit(frame: Record<string, unknown>): number {
+  const type = frame.type;
+  if (
+    type === "message_start" ||
+    type === "message_update" ||
+    type === "message_end" ||
+    type === "agent_end" ||
+    type === "subagent_event"
+  ) {
+    return OMP_MAX_CONTENT_PARTS;
+  }
+  return 1_024;
+}
 const OmpModelsResultSchema = z.object({
   models: z.array(OmpModelSchema).min(1).max(256),
 });
@@ -1989,14 +2248,6 @@ class OmpRpcProcess {
       return;
     }
     if (this.receiveKnownResponse(decoded)) return;
-    if (this.receiveDegradedAgentEnd(decoded, true)) return;
-    if (
-      boundedJsonBytes(decoded, MAX_SEMANTIC_FRAME_BYTES, 1_024, MAX_IMAGE_DATA_LENGTH, 4_096) ===
-      Number.POSITIVE_INFINITY
-    ) {
-      this.recordProtocolViolation();
-      return;
-    }
     const frame = JsonObjectSchema.safeParse(decoded);
     if (!frame.success) {
       this.recordProtocolViolation();
@@ -2073,19 +2324,6 @@ class OmpRpcProcess {
       return;
     }
     if (this.receiveKnownResponse(decodedFrame)) return;
-    if (this.receiveDegradedAgentEnd(decodedFrame, true)) return;
-    if (
-      boundedJsonBytes(
-        decodedFrame,
-        MAX_SEMANTIC_FRAME_BYTES,
-        1_024,
-        MAX_IMAGE_DATA_LENGTH,
-        4_096,
-      ) === Number.POSITIVE_INFINITY
-    ) {
-      this.recordProtocolViolation();
-      return;
-    }
     const frameObject = JsonObjectSchema.safeParse(decodedFrame);
     if (!frameObject.success) {
       this.recordProtocolViolation();
@@ -2130,6 +2368,11 @@ class OmpRpcProcess {
     const isBranchHistory = pending.command === "get_branch_messages";
     const isHistory =
       pending.command === "get_messages" || pending.command === "get_subagent_messages";
+    const responseData = isHistory
+      ? sanitizeHistoryResponseData(response.data.data)
+      : response.data.data;
+    const boundedFrame =
+      responseData === response.data.data ? frame : { ...frame, data: responseData };
     const responseItemLimit = isBranchHistory ? 1_024 : isHistory ? 100_000 : MAX_ARRAY_ITEMS;
     const responseByteLimit =
       isBranchHistory || isHistory
@@ -2146,7 +2389,7 @@ class OmpRpcProcess {
           : 2_048;
     if (
       boundedJsonBytes(
-        frame,
+        boundedFrame,
         responseByteLimit,
         responseItemLimit,
         MAX_IMAGE_DATA_LENGTH,
@@ -2162,7 +2405,7 @@ class OmpRpcProcess {
     if (!settled) return;
     if (response.data.success) {
       try {
-        settled.beforeResolve?.(response.data.data);
+        settled.beforeResolve?.(responseData);
         if (settled.command === "prompt") {
           if (this.acceptedPromptIds.size >= MAX_PENDING_REQUESTS) {
             const oldest = this.acceptedPromptIds.values().next().value;
@@ -2170,7 +2413,7 @@ class OmpRpcProcess {
           }
           this.acceptedPromptIds.add(response.data.id);
         }
-        settled.resolve(response.data.data);
+        settled.resolve(responseData);
       } catch {
         settled.reject(new Error("OMP RPC response is invalid"));
       }
@@ -2219,21 +2462,27 @@ class OmpRpcProcess {
       this.fail(new Error("OMP emitted invalid terminal metadata"));
       return true;
     }
+    const structuralFrame = mapRuntimeFrameDetails(frame, omitOptionalDetails);
     const messagesAreSafe =
       frame.messages === undefined ||
       (Array.isArray(frame.messages) &&
         frame.messages.length <= MAX_ARRAY_ITEMS &&
         boundedJsonBytes(
-          frame.messages,
+          structuralFrame.messages as unknown[],
           MAX_SEMANTIC_FRAME_BYTES,
-          MAX_ARRAY_ITEMS,
+          OMP_MAX_CONTENT_PARTS,
           MAX_TEXT_LENGTH,
           4_096,
         ) !== Number.POSITIVE_INFINITY);
     const payloadIsSafe =
       messagesAreSafe &&
-      boundedJsonBytes(frame, MAX_SEMANTIC_FRAME_BYTES, 1_024, MAX_IMAGE_DATA_LENGTH, 4_096) !==
-        Number.POSITIVE_INFINITY;
+      boundedJsonBytes(
+        structuralFrame,
+        MAX_SEMANTIC_FRAME_BYTES,
+        OMP_MAX_CONTENT_PARTS,
+        MAX_IMAGE_DATA_LENGTH,
+        4_096,
+      ) !== Number.POSITIVE_INFINITY;
     if (onlyUnsafePayload && payloadIsSafe) return false;
     if (envelope.data.isTerminal === false) {
       this.fail(new Error("OMP emitted an invalid nonterminal agent_end payload"));
@@ -2260,16 +2509,22 @@ class OmpRpcProcess {
       this.recordProtocolViolation();
       return;
     }
-    if (this.receiveDegradedAgentEnd(frame, true)) return;
+    const safeFrame = mapRuntimeFrameDetails(frame, createOptionalMetadataSanitizer());
+    if (this.receiveDegradedAgentEnd(safeFrame, true)) return;
     if (
-      boundedJsonBytes(frame, MAX_SEMANTIC_FRAME_BYTES, 1_024, MAX_IMAGE_DATA_LENGTH, 4_096) ===
-      Number.POSITIVE_INFINITY
+      boundedJsonBytes(
+        mapRuntimeFrameDetails(safeFrame, omitOptionalDetails),
+        MAX_SEMANTIC_FRAME_BYTES,
+        runtimeFrameCollectionLimit(safeFrame),
+        MAX_IMAGE_DATA_LENGTH,
+        4_096,
+      ) === Number.POSITIVE_INFINITY
     ) {
       this.recordProtocolViolation();
       return;
     }
     if (type === "rpc_chunk") {
-      const chunk = OmpChunkFrameSchema.safeParse(frame);
+      const chunk = OmpChunkFrameSchema.safeParse(safeFrame);
       if (!chunk.success) this.rejectChunk();
       else this.receiveChunk(chunk.data);
       return;
@@ -2287,7 +2542,7 @@ class OmpRpcProcess {
         this.recordProtocolViolation();
         return;
       }
-      const ready = OmpReadyFrameSchema.safeParse(frame);
+      const ready = OmpReadyFrameSchema.safeParse(safeFrame);
       if (!ready.success) {
         this.recordProtocolViolation();
       } else {
@@ -2297,13 +2552,13 @@ class OmpRpcProcess {
       return;
     }
     if (type === "response") {
-      this.receiveResponse(frame);
+      this.receiveResponse(safeFrame);
       return;
     }
-    const event = OmpRuntimeEventSchema.safeParse(frame);
+    const event = OmpRuntimeEventSchema.safeParse(safeFrame);
     if (!event.success) {
-      this.rejectMatchingToolApproval(frame);
-      if (type === "agent_end" && this.receiveDegradedAgentEnd(frame, false)) return;
+      this.rejectMatchingToolApproval(safeFrame);
+      if (type === "agent_end" && this.receiveDegradedAgentEnd(safeFrame, false)) return;
       this.recordProtocolViolation();
       return;
     }
@@ -2728,7 +2983,10 @@ export class OmpRpcRuntime implements OmpRuntime {
     );
     return {
       ...transcript,
-      messages: z.array(OmpMessageSchema).max(100_000).parse(transcript.messages),
+      messages: z
+        .array(OmpMessageSchema)
+        .max(100_000)
+        .parse(sanitizeMessageListMetadata(transcript.messages)),
     };
   }
   async readPersistedSubagentTranscript(options: {
@@ -2745,7 +3003,10 @@ export class OmpRpcRuntime implements OmpRuntime {
     );
     return {
       ...transcript,
-      messages: z.array(OmpMessageSchema).max(100_000).parse(transcript.messages),
+      messages: z
+        .array(OmpMessageSchema)
+        .max(100_000)
+        .parse(sanitizeMessageListMetadata(transcript.messages)),
     };
   }
 

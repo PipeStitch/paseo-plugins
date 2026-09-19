@@ -1572,6 +1572,361 @@ describe("OMP RPC transport", () => {
     await session.close();
   });
 
+  test("accepts bounded read metadata with more than 1,024 source entries", async () => {
+    const child = new FakeRpcChild();
+    const sourceEntries = Array.from({ length: 1_223 }, (_, index) => `line-${index}`);
+    const details = {
+      contentType: "text",
+      meta: { source: { value: sourceEntries } },
+      displayContent: { lineNumbers: sourceEntries },
+    };
+    const toolResult = {
+      role: "toolResult" as const,
+      toolCallId: "call-1",
+      toolName: "read",
+      content: [{ type: "text", text: "result" }],
+      details,
+    };
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+        return;
+      }
+      if (command.type === "get_messages") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: {
+            messages: Array.from({ length: 4 }, (_, index) => ({
+              ...toolResult,
+              toolCallId: `call-${index}`,
+            })),
+          },
+        });
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+
+    const toolStart = nextEvent((listener) => session.onEvent(listener));
+    child.write({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+    await expect(toolStart).resolves.toMatchObject({ type: "tool_execution_start" });
+
+    const toolEnd = nextEvent((listener) => session.onEvent(listener));
+    child.write({
+      type: "tool_execution_end",
+      toolCallId: "call-1",
+      toolName: "read",
+      result: { content: toolResult.content, details },
+    });
+    await expect(toolEnd).resolves.toMatchObject({
+      type: "tool_execution_end",
+      result: { details },
+    });
+
+    const messageEnd = nextEvent((listener) => session.onEvent(listener));
+    child.write({ type: "message_end", message: toolResult });
+    await expect(messageEnd).resolves.toMatchObject({ type: "message_end", message: { details } });
+    const history = await session.getMessages();
+    expect(history.map((message) => message.details !== undefined)).toEqual([
+      true,
+      false,
+      false,
+      false,
+    ]);
+
+    const terminal = nextEvent((listener) => session.onEvent(listener));
+    child.write({
+      type: "agent_end",
+      messages: [
+        toolResult,
+        { role: "assistant", id: "answer-1", content: "done", stopReason: "stop" },
+      ],
+      messageCount: 2,
+      isTerminal: true,
+    });
+    await expect(terminal).resolves.toMatchObject({
+      type: "agent_end",
+      messages: [expect.objectContaining({ toolCallId: "call-1" }), { stopReason: "stop" }],
+      messageCount: 2,
+      isTerminal: true,
+    });
+    await session.close();
+  });
+
+  test("omits over-budget optional metadata without losing completion evidence", async () => {
+    const child = new FakeRpcChild();
+    const details = {
+      contentType: "text",
+      meta: {
+        source: {
+          value: Array.from({ length: 2_049 }, (_, index) => `line-${index}`),
+        },
+      },
+    };
+    const toolResult = {
+      role: "toolResult" as const,
+      id: "tool-message-1",
+      toolCallId: "call-oversized",
+      toolName: "read",
+      content: [{ type: "text", text: "result" }],
+      details,
+    };
+    const assistant = {
+      role: "assistant" as const,
+      id: "answer-oversized",
+      content: "done",
+      stopReason: "stop",
+      details,
+    };
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+        return;
+      }
+      if (command.type === "get_messages") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { messages: [toolResult, assistant] },
+        });
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+
+    const toolStart = nextEvent((listener) => session.onEvent(listener));
+    child.write({
+      type: "tool_execution_start",
+      toolCallId: "call-oversized",
+      toolName: "read",
+      args: {},
+    });
+    await expect(toolStart).resolves.toMatchObject({
+      type: "tool_execution_start",
+      toolCallId: "call-oversized",
+    });
+
+    const toolEnd = nextEvent((listener) => session.onEvent(listener));
+    child.write({
+      type: "tool_execution_end",
+      toolCallId: "call-oversized",
+      toolName: "read",
+      result: { content: toolResult.content, details },
+    });
+    await expect(toolEnd).resolves.toEqual({
+      type: "tool_execution_end",
+      toolCallId: "call-oversized",
+      toolName: "read",
+      result: { content: toolResult.content },
+    });
+
+    const toolMessageEnd = nextEvent((listener) => session.onEvent(listener));
+    child.write({ type: "message_end", message: toolResult });
+    await expect(toolMessageEnd).resolves.toEqual({
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        id: "tool-message-1",
+        toolCallId: "call-oversized",
+        toolName: "read",
+        content: toolResult.content,
+      },
+    });
+
+    const assistantEnd = nextEvent((listener) => session.onEvent(listener));
+    child.write({ type: "message_end", message: assistant });
+    await expect(assistantEnd).resolves.toEqual({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        id: "answer-oversized",
+        content: "done",
+        stopReason: "stop",
+      },
+    });
+
+    const terminal = nextEvent((listener) => session.onEvent(listener));
+    child.write({
+      type: "agent_end",
+      requestId: "prompt-oversized",
+      messages: [toolResult, assistant],
+      messageCount: 2,
+      isTerminal: true,
+    });
+    await expect(terminal).resolves.toEqual({
+      requestId: "prompt-oversized",
+      type: "agent_end",
+      messages: [
+        {
+          role: "toolResult",
+          id: "tool-message-1",
+          toolCallId: "call-oversized",
+          toolName: "read",
+          content: toolResult.content,
+        },
+        {
+          role: "assistant",
+          id: "answer-oversized",
+          content: "done",
+          stopReason: "stop",
+        },
+      ],
+      messageCount: 2,
+      isTerminal: true,
+    });
+
+    await expect(session.getMessages()).resolves.toEqual([
+      {
+        role: "toolResult",
+        id: "tool-message-1",
+        toolCallId: "call-oversized",
+        toolName: "read",
+        content: toolResult.content,
+      },
+      {
+        role: "assistant",
+        id: "answer-oversized",
+        content: "done",
+        stopReason: "stop",
+      },
+    ]);
+    await session.close();
+  });
+
+  test.each([
+    ["byte", { payload: "x".repeat(256 * 1024 + 1) }],
+    ["node", { groups: Array.from({ length: 1_024 }, () => ({ a: 1, b: 2, c: 3 })) }],
+    [
+      "depth",
+      Array.from({ length: 18 }).reduce<Record<string, unknown>>((nested) => ({ nested }), {}),
+    ],
+  ])("omits optional metadata beyond the %s budget", async (_budget, details) => {
+    const child = new FakeRpcChild();
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    observeCommands(child, (command) => {
+      if (command.type !== "negotiate_protocol") return;
+      child.write({
+        type: "response",
+        id: command.id,
+        success: true,
+        data: { protocolVersion: 2 },
+      });
+    });
+    child.write(READY_FRAME);
+    const session = await opening;
+    const messageEnd = nextEvent((listener) => session.onEvent(listener));
+
+    child.write({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        id: `bounded-${_budget}`,
+        content: "done",
+        stopReason: "stop",
+        details,
+      },
+    });
+    await expect(messageEnd).resolves.toEqual({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        id: `bounded-${_budget}`,
+        content: "done",
+        stopReason: "stop",
+      },
+    });
+    await session.close();
+  });
+
+  test("preserves bounded task correlation in a degraded nested subagent event", async () => {
+    const child = new FakeRpcChild();
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    observeCommands(child, (command) => {
+      if (command.type !== "negotiate_protocol") return;
+      child.write({
+        type: "response",
+        id: command.id,
+        success: true,
+        data: { protocolVersion: 2 },
+      });
+    });
+    child.write(READY_FRAME);
+    const session = await opening;
+    const nestedEvent = nextEvent((listener) => session.onEvent(listener));
+
+    child.write({
+      type: "subagent_event",
+      payload: {
+        id: "parent-child",
+        event: {
+          type: "tool_execution_end",
+          toolCallId: "nested-task",
+          toolName: "task",
+          result: {
+            details: {
+              results: [
+                {
+                  id: "nested-child",
+                  status: "failed",
+                  error: "child failed",
+                  aborted: false,
+                  ancillary: "discarded",
+                },
+                { id: "prototype-status", status: "toString" },
+              ],
+              progress: [{ id: "nested-child", index: 0, status: "completed", extra: true }],
+              displayContent: {
+                lineNumbers: Array.from({ length: 2_049 }, (_, index) => index),
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await expect(nestedEvent).resolves.toEqual({
+      type: "subagent_event",
+      payload: {
+        id: "parent-child",
+        event: {
+          type: "tool_execution_end",
+          toolCallId: "nested-task",
+          toolName: "task",
+          result: {
+            details: {
+              results: [
+                {
+                  id: "nested-child",
+                  status: "failed",
+                  error: "child failed",
+                  aborted: false,
+                },
+                { id: "prototype-status" },
+              ],
+              progress: [{ id: "nested-child", index: 0, status: "completed" }],
+            },
+          },
+        },
+      },
+    });
+    await session.close();
+  });
+
   test("reads byte-heavy history through negotiated v2 chunking", async () => {
     const child = new FakeRpcChild();
     const text = "é".repeat(350_000);
