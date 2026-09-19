@@ -8,16 +8,17 @@ parent-child relationships across workspace boundaries.
 
 ## Screenshots
 
-Names, workspaces, and task details in these screenshots are synthetic. The rendered page was
-rewritten before capture so no private project or session identifiers are published.
+Agent, workspace, and task details come from an isolated synthetic workspace. Both PNGs were
+captured at 2× pixel density after browser DevTools rewrote local paths and host labels and verified
+that no private organization names remained in the rendered page.
 
 ### Crew overview
 
-![Agent Crew descendant tree and status filters](docs/images/agent-crew-overview.png)
+![Agent Crew descendant tree and status filters](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/agent-crew/docs/images/agent-crew-overview.png)
 
 ### Safe action confirmation
 
-![Agent Crew nudge confirmation](docs/images/agent-crew-action.png)
+![Agent Crew nudge confirmation](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/agent-crew/docs/images/agent-crew-action.png)
 
 ## What it shows
 

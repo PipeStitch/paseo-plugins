@@ -4,6 +4,20 @@ Community OMP integration for Paseo. The plugin registers the distinct `omp-plug
 
 > **Alpha preview:** persistence and protocol contracts are tested, but upgrades may still require re-importing sessions created by an earlier preview.
 
+## Screenshots
+
+Both PNGs come from the plugin's isolated Paseo development daemon at 2× pixel density. Browser
+DevTools rewrites local filesystem paths and verifies that no private organization names remain
+before capture.
+
+### Native plugin manager
+
+![OMP native plugin manager](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-omp/docs/images/plugin-manager.png)
+
+### Typed OMP configuration
+
+![OMP typed configuration editor](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-omp/docs/images/workspace-settings.png)
+
 ## Quick start
 
 Requirements: Paseo `>=0.9.0-beta.1 <0.10.0`, OMP `18.1.15` or newer, and OMP RPC protocol v2. Paseo 0.9 is required for the Help report's supported copy and external-link APIs, nested provider-subagent ancestry, spawning-tool links, npm-managed installation, and the complete client integration.

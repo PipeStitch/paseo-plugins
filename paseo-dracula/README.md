@@ -2,9 +2,18 @@
 
 > Dracula Classic and Alucard Classic app themes for Paseo.
 
-![Dracula Classic selected in Paseo Appearance settings](./screenshot.png)
+## Screenshots
 
-![Alucard Classic selected in Paseo Appearance settings](./screenshot-alucard.png)
+Both theme previews come from an isolated Paseo test daemon at 2× pixel density. Browser DevTools
+replaces the local host label and verifies that no private organization names remain before capture.
+
+### Dracula Classic
+
+![Dracula Classic selected in Paseo Appearance settings](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-dracula/screenshot.png)
+
+### Alucard Classic
+
+![Alucard Classic selected in Paseo Appearance settings](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-dracula/screenshot-alucard.png)
 
 ## Install
 

@@ -5,25 +5,22 @@ surface and a workspace-scoped Factory panel.
 
 ## Screenshots
 
-These screenshots use a temporary local Gas City v1.4.1 fixture. They contain no private project
-or session data.
-Wide captures omit Paseo's host navigation so the plugin surface remains the focus.
+These PNGs use a temporary local Gas City v1.4.1 fixture and an isolated Paseo test daemon. Browser
+DevTools verifies that no private organization names remain before each 2× capture. Wide captures
+omit Paseo's host navigation so the plugin surface remains the focus.
 
 ### Wide overview
 
-![Gas City supervisor, city status, sessions, convoys, and work](docs/images/paseo-gas-city-wide-overview.webp)
+![Gas City supervisor, city status, sessions, convoys, and work](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-gas-city/docs/images/paseo-gas-city-wide-overview.png)
 
 ### Work and event feed
 
-![Gas City sessions, work, and recent event feed](docs/images/paseo-gas-city-wide-events.webp)
+![Gas City sessions, work, and recent event feed](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-gas-city/docs/images/paseo-gas-city-wide-events.png)
 
-### Guarded dispatch
-
-![Observe-only Gas City dispatch confirmation](docs/images/paseo-gas-city-dispatch-confirmation.webp)
 
 ### Compact layout
 
-![Gas City compact mobile layout](docs/images/paseo-gas-city-compact-overview.webp)
+![Gas City compact mobile layout](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-gas-city/docs/images/paseo-gas-city-compact-overview.png)
 
 ## What it does
 

@@ -6,14 +6,9 @@ import { unzipSync } from "fflate";
 
 const packageRoot = join(import.meta.dirname, "..");
 const requiredFiles = [
-  "CHANGELOG.md",
   "icon.svg",
   "LICENSE",
   "README.md",
-  "docs/images/paseo-gas-city-wide-overview.webp",
-  "docs/images/paseo-gas-city-wide-events.webp",
-  "docs/images/paseo-gas-city-dispatch-confirmation.webp",
-  "docs/images/paseo-gas-city-compact-overview.webp",
   "index.client.tsx",
   "index.server.ts",
   "client/city-operations.tsx",
@@ -71,8 +66,17 @@ function isPlaceholder(path: string) {
   return path === ".gitkeep" || path.endsWith("/.gitkeep");
 }
 
+function isNonRuntimeFile(path: string) {
+  return (
+    isInDirectory(path, "docs") ||
+    ["CHANGELOG.md", "INSTALL.md", "SUPPORT.md", "TESTING.md"].includes(path) ||
+    /\.(?:png|webp|jpe?g)$/iu.test(path)
+  );
+}
+
 function isForbiddenNpmFile(path: string) {
   return (
+    isNonRuntimeFile(path) ||
     isInDirectory(path, "tests") ||
     isInDirectory(path, "test") ||
     isInDirectory(path, "scripts") ||
@@ -87,6 +91,7 @@ function isForbiddenNpmFile(path: string) {
 
 function isForbiddenReleaseFile(path: string) {
   return (
+    isNonRuntimeFile(path) ||
     isInDirectory(path, "tests") ||
     isInDirectory(path, "test") ||
     isInDirectory(path, "scripts") ||

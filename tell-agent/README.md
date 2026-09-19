@@ -2,6 +2,20 @@
 
 Send a message from one Paseo agent to another agent or workspace on the same daemon host.
 
+## Screenshots
+
+Agent and workspace names are synthetic. Both PNGs were captured from an isolated Paseo test
+daemon at 2× pixel density after browser DevTools verified that no private organization names
+remained in the rendered page.
+
+### Choose a target
+
+![Tell Agent target picker](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/tell-agent/docs/images/tell-agent-picker.png)
+
+### Compose an instruction
+
+![Tell Agent instruction composer](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/tell-agent/docs/images/tell-agent-compose.png)
+
 ## Install
 
 ### Paseo 0.9.0-beta.1 or later

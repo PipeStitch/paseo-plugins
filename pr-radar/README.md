@@ -6,16 +6,16 @@ PR Radar combines Paseo workspace and agent state with pull request checks, revi
 
 ## Screenshots
 
-Repository, pull request, workspace, and agent names in these screenshots are synthetic. The live
-browser DOM was rewritten before capture so no private identifiers are published.
+Repository, pull request, workspace, and agent names are rewritten to synthetic values in browser
+DevTools before capture. Both PNGs come from an isolated Paseo test daemon at 2× pixel density.
 
 ### Wide dashboard
 
-![PR Radar wide dashboard](docs/images/pr-radar-github-inbox-wide.png)
+![PR Radar wide dashboard](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/pr-radar/docs/images/pr-radar-github-inbox-wide.png)
 
 ### Compact dashboard
 
-![PR Radar compact dashboard](docs/images/pr-radar-github-inbox-compact.png)
+![PR Radar compact dashboard](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/pr-radar/docs/images/pr-radar-github-inbox-compact.png)
 
 ## What it shows
 

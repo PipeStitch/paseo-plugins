@@ -8,16 +8,17 @@ It adds a workspace-scoped **Beads** Explorer panel and an **Open Beads** Comman
 
 ## Screenshots
 
-Issue IDs, titles, assignees, labels, and issue details in these screenshots are synthetic. They do
-not contain data from a real Beads project.
+Issue IDs, titles, assignees, labels, and details come from a temporary synthetic Beads project.
+Both PNGs were captured from an isolated Paseo daemon at 2× pixel density after browser DevTools
+verified the rendered page contained no private organization names.
 
 ### Wide
 
-![Paseo Beads wide work queue](docs/images/paseo-beads-wide.png)
+![Paseo Beads wide work queue](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-beads/docs/images/paseo-beads-wide.png)
 
 ### Compact
 
-![Paseo Beads compact work queue](docs/images/paseo-beads-compact.png)
+![Paseo Beads compact work queue](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/paseo-beads/docs/images/paseo-beads-compact.png)
 
 ## What it shows
 

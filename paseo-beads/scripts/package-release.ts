@@ -8,12 +8,8 @@ const packageJson = JSON.parse(
 
 const releaseFiles = [
   "package-lock.json",
-  "CHANGELOG.md",
   "LICENSE",
   "README.md",
-  "biome.json",
-  "docs/images/paseo-beads-wide.png",
-  "docs/images/paseo-beads-compact.png",
   "index.client.tsx",
   "index.server.ts",
   "client/beads-view.ts",
@@ -23,7 +19,6 @@ const releaseFiles = [
   "shared/beads.ts",
   "package.json",
   "paseo-plugin.json",
-  "tsconfig.json",
 ] as const;
 
 const output = process.argv[2] ?? `dist/paseo-beads-v${packageJson.version}.zip`;

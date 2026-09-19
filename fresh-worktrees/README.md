@@ -6,6 +6,20 @@ branch-off workspace.
 The plugin runs the refresh inside the Paseo daemon and adds a workspace-header indicator when an
 active worktree falls behind the source checkout's remote base.
 
+## Screenshots
+
+The repository, remote, branch, and workspace are disposable local fixtures. Both PNGs come from
+an isolated Paseo test daemon at 2× pixel density. Browser DevTools rewrites local paths and host
+labels and verifies that no private organization names remain before capture.
+
+### Behind indicator
+
+![Fresh Worktrees behind indicator](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/fresh-worktrees/docs/images/fresh-worktrees-behind.png)
+
+### Installed plugin
+
+![Fresh Worktrees plugin settings](https://raw.githubusercontent.com/omercnet/paseo-plugins/main/fresh-worktrees/docs/images/fresh-worktrees-settings.png)
+
 ## Behavior
 
 Before Paseo creates a branch-off worktree, the plugin:
