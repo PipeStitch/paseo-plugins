@@ -8,7 +8,12 @@ import {
   parseOmpSettingsList,
   updateOmpSettingsWithDependencies,
 } from "../server/omp-settings";
-import { categorizeOmpSetting, formatOmpSettingLabel } from "../shared/omp-settings";
+import {
+  categorizeOmpSetting,
+  formatOmpSettingLabel,
+  OmpModelSelectorSchema,
+  updateOmpSettings,
+} from "../shared/omp-settings";
 
 describe("OMP settings inventory", () => {
   test("preserves typed values while withholding credential-shaped values", () => {
@@ -77,6 +82,17 @@ describe("OMP settings inventory", () => {
       "Stream Idle Timeout Seconds",
     );
   });
+
+  test("accepts selectors through 513 UTF-8 bytes", () => {
+    const selector = `p/${"m".repeat(511)}`;
+    expect(selector).toHaveLength(513);
+    expect(OmpModelSelectorSchema.safeParse(selector).success).toBe(true);
+    expect(OmpModelSelectorSchema.safeParse(`${selector}x`).success).toBe(false);
+
+    const multibyteBoundary = `p/${"é".repeat(255)}x`;
+    expect(OmpModelSelectorSchema.safeParse(multibyteBoundary).success).toBe(true);
+    expect(OmpModelSelectorSchema.safeParse(`${multibyteBoundary}y`).success).toBe(false);
+  });
 });
 
 describe("OMP scalar settings updates", () => {
@@ -85,6 +101,13 @@ describe("OMP scalar settings updates", () => {
       "retry.enabled": { value: true, type: "boolean", description: "" },
       temperature: { value: 0.5, type: "number", description: "" },
       personality: { value: "default", type: "enum", description: "" },
+      modelRoles: { value: { default: "openai/gpt-5" }, type: "record", description: "" },
+      "retry.fallbackChains": { value: {}, type: "record", description: "" },
+      cycleOrder: { value: ["smol", "default"], type: "array", description: "" },
+      "task.agentModelOverrides": { value: {}, type: "record", description: "" },
+      "task.agentServiceTierOverrides": { value: {}, type: "record", description: "" },
+      "task.agentPrewalk": { value: {}, type: "record", description: "" },
+      "task.agentAdvisor": { value: {}, type: "record", description: "" },
     };
     const commands: string[][] = [];
     const dependencies: OmpSettingsDependencies = {
@@ -113,7 +136,9 @@ describe("OMP scalar settings updates", () => {
                 ? serializedValue === "true"
                 : setting.type === "number"
                   ? Number(serializedValue)
-                  : serializedValue;
+                  : setting.type === "array" || setting.type === "record"
+                    ? JSON.parse(serializedValue)
+                    : serializedValue;
           }
         }
         if (args[0] === "reset" && args[1] === "retry.enabled") values[args[1]].value = false;
@@ -159,6 +184,146 @@ describe("OMP scalar settings updates", () => {
     expect(result.appliedPaths).toEqual(["personality", "retry.enabled"]);
     expect(commands).toContainEqual(["set", "personality", "--json", "--", "concise"]);
     expect(commands).toContainEqual(["reset", "retry.enabled"]);
+  });
+
+  test("serializes each typed routing setting through native config set and reset", async () => {
+    const { commands, dependencies } = harness();
+    const listed = await listOmpSettingsWithDependencies({}, dependencies);
+    const result = await updateOmpSettingsWithDependencies(
+      {
+        revision: listed.revision ?? "",
+        changes: [
+          { operation: "set", path: "modelRoles", value: { default: "azure/gpt-5.6-sol" } },
+          {
+            operation: "set",
+            path: "retry.fallbackChains",
+            value: {
+              default: [],
+              review: ["openai/gpt-5-mini", "anthropic/claude-opus-5:high"],
+            },
+          },
+          { operation: "set", path: "cycleOrder", value: ["default", "smol", "slow"] },
+          {
+            operation: "set",
+            path: "task.agentModelOverrides",
+            value: { reviewer: ["@review", "openai/gpt-5"] },
+          },
+          {
+            operation: "set",
+            path: "task.agentServiceTierOverrides",
+            value: { reviewer: "priority" },
+          },
+          { operation: "set", path: "task.agentPrewalk", value: { reviewer: "@smol" } },
+          { operation: "set", path: "task.agentAdvisor", value: { reviewer: "on" } },
+        ],
+      },
+      dependencies,
+    );
+
+    expect(result.conflict).toBe(false);
+    expect(commands).toContainEqual([
+      "set",
+      "modelRoles",
+      "--json",
+      "--",
+      JSON.stringify({ default: "azure/gpt-5.6-sol" }),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "retry.fallbackChains",
+      "--json",
+      "--",
+      JSON.stringify({
+        default: [],
+        review: ["openai/gpt-5-mini", "anthropic/claude-opus-5:high"],
+      }),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "task.agentModelOverrides",
+      "--json",
+      "--",
+      JSON.stringify({ reviewer: ["@review", "openai/gpt-5"] }),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "cycleOrder",
+      "--json",
+      "--",
+      JSON.stringify(["default", "smol", "slow"]),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "task.agentServiceTierOverrides",
+      "--json",
+      "--",
+      JSON.stringify({ reviewer: "priority" }),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "task.agentPrewalk",
+      "--json",
+      "--",
+      JSON.stringify({ reviewer: "@smol" }),
+    ]);
+    expect(commands).toContainEqual([
+      "set",
+      "task.agentAdvisor",
+      "--json",
+      "--",
+      JSON.stringify({ reviewer: "on" }),
+    ]);
+
+    const reset = await updateOmpSettingsWithDependencies(
+      {
+        revision: result.catalog.revision ?? "",
+        changes: [{ operation: "reset", path: "modelRoles" }],
+      },
+      dependencies,
+    );
+    expect(reset.appliedPaths).toEqual(["modelRoles"]);
+    expect(commands).toContainEqual(["reset", "modelRoles"]);
+  });
+
+  test("rejects malformed routing input before a config mutation can execute", async () => {
+    expect(
+      updateOmpSettings.input.safeParse({
+        revision: "revision",
+        changes: [{ operation: "set", path: "modelRoles", value: { "bad role": "openai/gpt-5" } }],
+      }).success,
+    ).toBe(false);
+    expect(
+      updateOmpSettings.input.safeParse({
+        revision: "revision",
+        changes: [
+          {
+            operation: "set",
+            path: "retry.fallbackChains",
+            value: { default: Array.from({ length: 17 }, () => "openai/gpt-5") },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      updateOmpSettings.input.safeParse({
+        revision: "revision",
+        changes: [{ operation: "set", path: "cycleOrder", value: ["default", "default"] }],
+      }).success,
+    ).toBe(false);
+
+    const { commands, dependencies } = harness();
+    const listed = await listOmpSettingsWithDependencies({}, dependencies);
+    const result = await updateOmpSettingsWithDependencies(
+      {
+        revision: listed.revision ?? "",
+        changes: [{ operation: "set", path: "modelRoles", value: { default: "bad selector" } }],
+      } as never,
+      dependencies,
+    );
+    expect(result.failed?.path).toBe("modelRoles");
+    expect(commands.filter(([operation]) => operation === "set" || operation === "reset")).toEqual(
+      [],
+    );
   });
 
   test("rejects stale revisions before running mutations", async () => {

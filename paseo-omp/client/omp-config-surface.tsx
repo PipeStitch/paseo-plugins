@@ -13,14 +13,16 @@ import type { TextStyle, ViewStyle } from "react-native";
 import { Pressable, ScrollView, Switch, Text, View } from "react-native";
 import type { ComposerPillSettings } from "../shared/composer-pill-settings";
 import { listOmpConfig, type OmpConfig } from "../shared/omp-config";
+import { listOmpModels } from "../shared/omp-models";
 import {
   categorizeOmpSetting,
   formatOmpSettingLabel,
+  isOmpStructuredSettingPath,
   listOmpSettings,
   OMP_SETTING_CATEGORIES,
-  type OmpScalarValue,
   type OmpSetting,
   type OmpSettingCategory,
+  parseOmpStructuredSettingValue,
   updateOmpSettings,
 } from "../shared/omp-settings";
 import { type OmpStore, storeLabel } from "../shared/omp-store";
@@ -34,7 +36,9 @@ import {
   OMP_SETTINGS_REFERENCE,
   type OmpDocumentationLink,
 } from "./omp-doc-links";
+import { normalizeOmpModels } from "./omp-model-picker-state";
 import { OmpPluginManagerSection } from "./omp-plugin-manager";
+import { type OmpModelCatalogState, StructuredRoutingEditor } from "./omp-routing-editor";
 import { OmpStorePicker } from "./omp-store-picker";
 import { ompStoreKey } from "./omp-store-state";
 import {
@@ -834,7 +838,7 @@ function StructuredSettingValue({
   );
 }
 
-type SettingDraft = { operation: "set"; value: string | boolean } | { operation: "reset" };
+type SettingDraft = { operation: "set"; value: unknown } | { operation: "reset" };
 
 function EditableScalarValue({
   setting,
@@ -891,6 +895,9 @@ function ConfigurationCategory({
   styles,
   settings,
   drafts,
+  theme,
+  modelCatalog,
+  modelRoles,
   disabled,
   workspaceScoped,
   onDraft,
@@ -898,6 +905,9 @@ function ConfigurationCategory({
 }: {
   category: { id: OmpSettingCategory; label: string };
   styles: OmpConfigStyles;
+  theme: PluginSurfaceProps["theme"];
+  modelCatalog: OmpModelCatalogState;
+  modelRoles: Readonly<Record<string, unknown>>;
   settings: readonly OmpSetting[];
   drafts: Readonly<Record<string, SettingDraft>>;
   disabled: boolean;
@@ -926,7 +936,12 @@ function ConfigurationCategory({
           (setting.value !== null && typeof setting.value === "object");
         const editable =
           !setting.redacted && ["boolean", "number", "string", "enum"].includes(setting.type);
+        const structuredEditable =
+          !setting.redacted &&
+          isOmpStructuredSettingPath(setting.path) &&
+          setting.type === (setting.path === "cycleOrder" ? "array" : "record");
         const settingDocumentation = documentationForSettingPath(setting.path);
+        const draft = drafts[setting.path];
         return (
           <View key={setting.path} style={styles.setting}>
             <View style={styles.settingHeader}>
@@ -934,7 +949,7 @@ function ConfigurationCategory({
               {setting.workspaceOverride ? (
                 <Text style={styles.source}>Workspace override</Text>
               ) : null}
-              {!complex && !editable ? (
+              {!complex && !editable && !structuredEditable ? (
                 <StructuredSettingValue setting={setting} styles={styles} />
               ) : null}
             </View>
@@ -953,11 +968,26 @@ function ConfigurationCategory({
             {editable ? (
               <EditableScalarValue
                 setting={setting}
-                draft={drafts[setting.path]}
+                draft={draft}
                 disabled={disabled}
                 resetLabel={workspaceScoped ? "Remove workspace override" : "Reset to default"}
                 showReset={!workspaceScoped || setting.workspaceOverride === true}
                 styles={styles}
+                onSet={(value) => onDraft(setting.path, { operation: "set", value })}
+                onReset={() => onDraft(setting.path, { operation: "reset" })}
+              />
+            ) : structuredEditable ? (
+              <StructuredRoutingEditor
+                setting={setting}
+                value={draft?.operation === "set" ? draft.value : setting.value}
+                disabled={disabled}
+                resetLabel={workspaceScoped ? "Remove workspace override" : "Reset to default"}
+                showReset={!workspaceScoped || setting.workspaceOverride === true}
+                resetPending={draft?.operation === "reset"}
+                styles={styles}
+                theme={theme}
+                modelCatalog={modelCatalog}
+                modelRoles={modelRoles}
                 onSet={(value) => onDraft(setting.path, { operation: "set", value })}
                 onReset={() => onDraft(setting.path, { operation: "reset" })}
               />
@@ -1022,6 +1052,7 @@ function OmpConfigContent({
   const loadConfig = useRpc(listOmpConfig);
   const loadSettings = useRpc(listOmpSettings);
   const updateSettings = useRpc(updateOmpSettings);
+  const loadModels = useRpc(listOmpModels);
   const queryClient = useQueryClient();
   const context = { store, ...(cwd ? { cwd } : {}) };
   const pendingMutations = useIsMutating({ mutationKey: ["paseo-omp"] });
@@ -1035,6 +1066,11 @@ function OmpConfigContent({
     queryKey: settingsQueryKey,
     queryFn: () => loadSettings(context),
     staleTime: Number.POSITIVE_INFINITY,
+  });
+  const modelsQuery = useQuery({
+    queryKey: ["paseo-omp", "models", ompStoreKey(store), cwd ?? "global"],
+    queryFn: () => loadModels(context),
+    staleTime: 30_000,
   });
   const [view, setView] = useState<SurfaceView>("overview");
   const [activeCategory, setActiveCategory] = useState<OmpSettingCategory>("appearance");
@@ -1065,6 +1101,24 @@ function OmpConfigContent({
     }
     return { sourceSettings, matching, byCategory };
   }, [configQuery.data?.config, normalizedSearch, settingsQuery.data]);
+  const modelCatalog: OmpModelCatalogState = {
+    models: normalizeOmpModels(modelsQuery.data?.models ?? []),
+    loading: modelsQuery.isLoading,
+    ...(modelsQuery.error
+      ? { error: "Could not list OMP models. Freeform selectors remain available." }
+      : {}),
+  };
+  const modelRolesValue = drafts.modelRoles
+    ? drafts.modelRoles.operation === "set"
+      ? drafts.modelRoles.value
+      : undefined
+    : catalog.sourceSettings.find((setting) => setting.path === "modelRoles")?.value;
+  const modelRoles =
+    modelRolesValue !== null &&
+    typeof modelRolesValue === "object" &&
+    !Array.isArray(modelRolesValue)
+      ? (modelRolesValue as Readonly<Record<string, unknown>>)
+      : {};
   const visibleCategories = CONFIG_CATEGORIES.filter(
     (category) => (catalog.byCategory.get(category.id)?.length ?? 0) > 0,
   );
@@ -1089,8 +1143,12 @@ function OmpConfigContent({
         if (draft.operation === "reset") return { operation: "reset" as const, path };
         const setting = byPath.get(path);
         if (!setting) throw new Error(`Setting ${path} is no longer available.`);
-        let value: OmpScalarValue = draft.value;
-        if (setting.type === "number") {
+        let value: unknown = draft.value;
+        if (isOmpStructuredSettingPath(path)) {
+          const parsed = parseOmpStructuredSettingValue(path, value);
+          if (parsed === undefined) throw new Error(`${path} contains invalid routing values.`);
+          value = parsed;
+        } else if (setting.type === "number") {
           const raw = String(draft.value).trim();
           if (!raw) throw new Error(`${path} requires a number.`);
           const parsed = Number(raw);
@@ -1099,7 +1157,8 @@ function OmpConfigContent({
         }
         return { operation: "set" as const, path, value };
       });
-      return updateSettings({ ...context, revision, changes });
+      const input = updateOmpSettings.input.parse({ ...context, revision, changes });
+      return updateSettings(input);
     },
     onSuccess: (result) => {
       queryClient.setQueryData(settingsQueryKey, result.catalog);
@@ -1221,14 +1280,22 @@ function OmpConfigContent({
                 accessibilityRole="button"
                 accessibilityLabel="Refresh OMP configuration"
                 style={styles.refresh}
-                disabled={configQuery.isFetching || settingsQuery.isFetching}
+                disabled={
+                  configQuery.isFetching || settingsQuery.isFetching || modelsQuery.isFetching
+                }
                 onPress={() => {
-                  void Promise.all([configQuery.refetch(), settingsQuery.refetch()]);
+                  void Promise.all([
+                    configQuery.refetch(),
+                    settingsQuery.refetch(),
+                    modelsQuery.refetch(),
+                  ]);
                 }}
               >
                 <Icon name="RefreshCw" size={14} color={theme.colors.foreground} />
                 <Text style={styles.refreshLabel}>
-                  {configQuery.isFetching || settingsQuery.isFetching ? "Refreshing…" : "Refresh"}
+                  {configQuery.isFetching || settingsQuery.isFetching || modelsQuery.isFetching
+                    ? "Refreshing…"
+                    : "Refresh"}
                 </Text>
               </Pressable>
             </View>
@@ -1364,6 +1431,9 @@ function OmpConfigContent({
                 {selectedCategory ? (
                   <ConfigurationCategory
                     category={selectedCategory}
+                    theme={theme}
+                    modelCatalog={modelCatalog}
+                    modelRoles={modelRoles}
                     styles={styles}
                     settings={catalog.byCategory.get(selectedCategory.id) ?? []}
                     drafts={drafts}

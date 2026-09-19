@@ -84,7 +84,7 @@ describe("plugin server bundle", () => {
       const module = factory(runtimeRequire);
       if (typeof module.default !== "function") throw new Error("Missing server contribution");
       const providers: ProviderRegistration[] = [];
-      const handlers: unknown[] = [];
+      const handlers: Array<[{ name: string }, unknown]> = [];
       const settings: unknown[] = [];
       const beforeHooks: unknown[] = [];
       const cleanup = module.default({
@@ -92,11 +92,13 @@ describe("plugin server bundle", () => {
           beforeHooks.push(args);
           return () => {};
         },
-        handle: (...args: unknown[]) => handlers.push(args),
+        handle: (contract: { name: string }, handler: unknown) =>
+          handlers.push([contract, handler]),
         registerSettings: (definition: unknown) => settings.push(definition),
         registerProvider: (provider: ProviderRegistration) => providers.push(provider),
       });
-      expect(handlers).toHaveLength(15);
+      expect(handlers).toHaveLength(16);
+      expect(handlers.map(([contract]) => contract.name)).toContain("paseo-omp.list-models");
       expect(settings).toEqual([
         expect.objectContaining({ id: "composer-pills", scope: "host", version: 1 }),
       ]);
