@@ -1991,6 +1991,47 @@ describe("OMP RPC transport", () => {
     await session.close();
   });
 
+  test("retains reassembled history responses above the live semantic bound", async () => {
+    const child = new FakeRpcChild();
+    const sevenMiB = "x".repeat(7 * 1024 * 1024);
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+      } else if (command.type === "get_messages") {
+        writeChunked(
+          child,
+          {
+            type: "response",
+            id: command.id,
+            success: true,
+            data: {
+              messages: [
+                { role: "assistant", id: "history-one", content: sevenMiB },
+                { role: "assistant", id: "history-two", content: sevenMiB },
+              ],
+            },
+          },
+          "large-history-response",
+        );
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+
+    const messages = await session.getMessages();
+    expect(messages).toHaveLength(2);
+    expect(messages.map((message) => ("content" in message ? message.content : undefined))).toEqual(
+      [sevenMiB, sevenMiB],
+    );
+    await session.close();
+  });
+
   test("rejects an explicit v1-only ready frame before negotiation", async () => {
     const child = new FakeRpcChild();
     const commands: Record<string, unknown>[] = [];
@@ -2116,7 +2157,7 @@ describe("OMP RPC transport", () => {
     await session.close();
   });
 
-  test("enforces chunked UTF-8 assistant and image boundaries without stale corruption", async () => {
+  test("carries bounded final text intact for redaction-first projection", async () => {
     const child = new FakeRpcChild();
     observeCommands(child, (command) => {
       if (command.type === "negotiate_protocol") {
@@ -2138,90 +2179,268 @@ describe("OMP RPC transport", () => {
       if (event.type === "agent_end") terminal.resolve();
     });
 
-    const nearText = "é".repeat((1024 * 1024) / 2);
+    const displayLimit = 4 * 1024 * 1024;
+    const withinLimit = "é".repeat(displayLimit / 2);
+    const overLimit = `${"x".repeat(displayLimit - 2)}abcd`;
     writeChunked(
       child,
       {
-        type: "message_update",
-        message: { role: "assistant", responseId: "text", content: nearText },
-      },
-      "near-text",
-    );
-    writeChunked(
-      child,
-      {
-        type: "message_update",
-        message: { role: "assistant", responseId: "oversized-text", content: `${nearText}é` },
-      },
-      "oversized-text",
-    );
-    const imageData = Buffer.concat([
-      Buffer.from("89504e470d0a1a0a", "hex"),
-      Buffer.alloc(6 * 1024 * 1024 - 8),
-    ]).toString("base64");
-    writeChunked(
-      child,
-      {
-        type: "message_update",
-        message: { role: "assistant", responseId: "image", content: [] },
-        assistantMessageEvent: {
-          type: "image_end",
-          contentIndex: 0,
-          content: { type: "image", data: imageData, mimeType: "image/png" },
+        type: "message_end",
+        message: {
+          role: "assistant",
+          responseId: "final-within-limit",
+          content: withinLimit,
+          stopReason: "stop",
         },
       },
-      "near-image",
+      "final-within-limit",
     );
     writeChunked(
       child,
       {
-        type: "message_update",
-        message: { role: "assistant", responseId: "oversized-image", content: [] },
-        assistantMessageEvent: {
-          type: "image_end",
-          contentIndex: 0,
-          content: { type: "image", data: `${imageData}AAAA`, mimeType: "image/png" },
-        },
+        type: "agent_end",
+        messages: [
+          {
+            role: "assistant",
+            entryId: "assistant-over-limit",
+            responseId: "response-over-limit",
+            content: overLimit,
+            stopReason: "length",
+          },
+          {
+            role: "bashExecution",
+            entryId: "bash-over-limit",
+            command: "generate-output",
+            output: overLimit,
+            exitCode: 137,
+            cancelled: true,
+            truncated: true,
+          },
+        ],
+        messageCount: 2,
+        isTerminal: true,
       },
-      "oversized-image",
+      "terminal-over-limit",
     );
-    child.write({
-      type: "agent_end",
-      messages: Array.from({ length: 513 }, () => ({ role: "assistant", content: "ok" })),
-      messageCount: 513,
-      isTerminal: true,
-    });
     await terminal.promise;
 
-    expect(events).toHaveLength(3);
-    const receivedText = events[0];
-    expect(
-      receivedText?.type === "message_update" && receivedText.message.role === "assistant"
-        ? receivedText.message.content
-        : null,
-    ).toBe(nearText);
-    const receivedImage = events[1];
-    expect(
-      receivedImage?.type === "message_update" &&
-        receivedImage.assistantMessageEvent?.content &&
-        typeof receivedImage.assistantMessageEvent.content === "object" &&
-        "data" in receivedImage.assistantMessageEvent.content
-        ? receivedImage.assistantMessageEvent.content.data
-        : null,
-    ).toBe(imageData);
-    expect(events[2]).toEqual({
-      type: "agent_end",
-      messageCount: 513,
-      isTerminal: true,
+    expect(events[0]).toEqual({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        responseId: "final-within-limit",
+        content: withinLimit,
+        stopReason: "stop",
+      },
     });
-    expect(
-      events.some(
-        (event) =>
-          event.type === "message_update" &&
-          (event.message.responseId === "oversized-text" ||
-            event.message.responseId === "oversized-image"),
-      ),
-    ).toBe(false);
+    const terminalEvent = events[1];
+    expect(terminalEvent).toEqual(
+      expect.objectContaining({ type: "agent_end", messageCount: 2, isTerminal: true }),
+    );
+    if (terminalEvent?.type !== "agent_end" || !terminalEvent.messages) {
+      throw new Error("Expected terminal messages");
+    }
+    const [assistant, bash] = terminalEvent.messages;
+    expect(assistant).toEqual(
+      expect.objectContaining({
+        role: "assistant",
+        entryId: "assistant-over-limit",
+        responseId: "response-over-limit",
+        stopReason: "length",
+      }),
+    );
+    expect(assistant && "content" in assistant ? assistant.content : undefined).toBe(overLimit);
+    expect(bash).toEqual(
+      expect.objectContaining({
+        role: "bashExecution",
+        entryId: "bash-over-limit",
+        command: "generate-output",
+        exitCode: 137,
+        cancelled: true,
+        truncated: true,
+      }),
+    );
+    expect(bash && "output" in bash ? bash.output : undefined).toBe(overLimit);
+    await session.close();
+  });
+
+  test("sanitizes oversized chunked message_end and agent_end payloads before admission", async () => {
+    const child = new FakeRpcChild();
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+    const events: OmpRpcEvent[] = [];
+    const terminal = Promise.withResolvers<void>();
+    session.onEvent((event) => {
+      events.push(event);
+      if (event.type === "agent_end") terminal.resolve();
+    });
+    const oversized = "x".repeat(8 * 1024 * 1024 + 1);
+
+    writeChunked(
+      child,
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          id: "assistant-native-id",
+          responseId: "assistant-response-id",
+          content: oversized,
+          stopReason: "length",
+        },
+      },
+      "oversized-message-end",
+    );
+    writeChunked(
+      child,
+      {
+        type: "agent_end",
+        messages: [
+          {
+            role: "bashExecution",
+            id: "bash-native-id",
+            entryId: "bash-entry-id",
+            command: "generate-output",
+            output: oversized,
+            exitCode: 137,
+            cancelled: true,
+            truncated: true,
+          },
+        ],
+        messageCount: 1,
+        isTerminal: true,
+      },
+      "oversized-agent-end",
+    );
+    await terminal.promise;
+
+    expect(events).toEqual([
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          id: "assistant-native-id",
+          responseId: "assistant-response-id",
+          content: "<truncated>",
+          stopReason: "length",
+        },
+      },
+      {
+        type: "agent_end",
+        messages: [
+          {
+            role: "bashExecution",
+            id: "bash-native-id",
+            entryId: "bash-entry-id",
+            command: "generate-output",
+            output: "<truncated>",
+            exitCode: 137,
+            cancelled: true,
+            truncated: true,
+          },
+        ],
+        messageCount: 1,
+        isTerminal: true,
+      },
+    ]);
+    await session.close();
+  });
+
+  test("rejects a 13 MiB chunked event while a history response is pending", async () => {
+    const child = new FakeRpcChild();
+    const historyRequested = Promise.withResolvers<void>();
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+      } else if (command.type === "get_messages") {
+        historyRequested.resolve();
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+    const events: OmpRpcEvent[] = [];
+    session.onEvent((event) => events.push(event));
+    const failure = nextEvent((listener) => session.onEvent(listener));
+    const history = session.getMessages();
+    void history.catch(() => undefined);
+    await historyRequested.promise;
+
+    writeChunked(
+      child,
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          id: "thirteen-mib-message",
+          content: "x".repeat(13 * 1024 * 1024),
+          stopReason: "length",
+        },
+      },
+      "thirteen-mib-event",
+    );
+
+    await expect(failure).resolves.toEqual({
+      type: "process_exit",
+      error: "OMP RPC frame exceeds the semantic byte limit",
+    });
+    await expect(history).rejects.toThrow("OMP RPC frame exceeds the semantic byte limit");
+    expect(events.some((event) => event.type === "message_end")).toBe(false);
+    await session.close();
+  });
+
+  test("keeps the physical limit for an unchunked oversized terminal payload", async () => {
+    const child = new FakeRpcChild();
+    observeCommands(child, (command) => {
+      if (command.type === "negotiate_protocol") {
+        child.write({
+          type: "response",
+          id: command.id,
+          success: true,
+          data: { protocolVersion: 2 },
+        });
+      }
+    });
+    const opening = runtimeFor(child).startSession({ cwd: "/repo", mode: "full" });
+    child.write(READY_FRAME);
+    const session = await opening;
+    const events: OmpRpcEvent[] = [];
+    const terminal = Promise.withResolvers<void>();
+    session.onEvent((event) => {
+      events.push(event);
+      if (event.type === "agent_end") terminal.resolve();
+    });
+
+    child.write({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        id: "oversized-physical-message",
+        content: "x".repeat(8 * 1024 * 1024 + 1),
+        stopReason: "length",
+      },
+    });
+    child.write({ type: "agent_end", messages: [], messageCount: 1, isTerminal: true });
+    await terminal.promise;
+
+    expect(events).toEqual([
+      { type: "agent_end", messages: [], messageCount: 1, isTerminal: true },
+    ]);
     await session.close();
   });
 

@@ -120,6 +120,76 @@ const IDENTIFIER = boundedString(MAX_ID_LENGTH, 1);
 const NAME = boundedString(MAX_NAME_LENGTH, 1);
 const OMP_PROVIDER_NAME = NAME.refine((provider) => !provider.includes("/"));
 const TEXT = boundedString(MAX_TEXT_LENGTH);
+const RAW_DISPLAY_TEXT = boundedString(MAX_IMAGE_DATA_LENGTH);
+const DISPLAY_TRUNCATION_MARKER = "<truncated>";
+
+function boundRawDisplayContent(value: unknown): unknown {
+  if (typeof value === "string") {
+    return utf8Bytes(value) <= MAX_IMAGE_DATA_LENGTH ? value : DISPLAY_TRUNCATION_MARKER;
+  }
+  if (!Array.isArray(value)) return value;
+  let totalBytes = 0;
+  for (const part of value) {
+    if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+    const record = part as Record<string, unknown>;
+    if (typeof record.text === "string") totalBytes += utf8Bytes(record.text);
+    if (typeof record.thinking === "string") totalBytes += utf8Bytes(record.thinking);
+  }
+  if (totalBytes <= MAX_IMAGE_DATA_LENGTH) return value;
+
+  let retainedMarker = false;
+  return value.map((part) => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return part;
+    const copy = { ...(part as Record<string, unknown>) };
+    for (const key of ["text", "thinking"] as const) {
+      if (typeof copy[key] !== "string") continue;
+      if (retainedMarker) delete copy[key];
+      else {
+        copy[key] = DISPLAY_TRUNCATION_MARKER;
+        retainedMarker = true;
+      }
+    }
+    return copy;
+  });
+}
+
+function sanitizeLiveMessageDisplay(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const message = value as Record<string, unknown>;
+  if (message.role === "assistant") {
+    const content = boundRawDisplayContent(message.content);
+    return content === message.content ? value : { ...message, content };
+  }
+  if (
+    message.role === "bashExecution" &&
+    typeof message.output === "string" &&
+    utf8Bytes(message.output) > MAX_IMAGE_DATA_LENGTH
+  ) {
+    return { ...message, output: DISPLAY_TRUNCATION_MARKER };
+  }
+  return value;
+}
+
+function sanitizeLiveDisplayFrame(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const frame = value as Record<string, unknown>;
+  if (
+    frame.type === "message_start" ||
+    frame.type === "message_update" ||
+    frame.type === "message_end"
+  ) {
+    const message = sanitizeLiveMessageDisplay(frame.message);
+    return message === frame.message ? value : { ...frame, message };
+  }
+  if (frame.type !== "agent_end" || !Array.isArray(frame.messages)) return value;
+  let changed = false;
+  const messages = frame.messages.map((message) => {
+    const sanitized = sanitizeLiveMessageDisplay(message);
+    if (sanitized !== message) changed = true;
+    return sanitized;
+  });
+  return changed ? { ...frame, messages } : value;
+}
 const OmpThinkingLevelSchema = z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 function isBoundedJson(
@@ -303,6 +373,14 @@ const OmpContentPartSchema = z
       context.addIssue({ code: "custom", message: "invalid image payload" });
     }
   });
+const OmpAssistantContentPartSchema = OmpContentPartSchema.safeExtend({
+  text: RAW_DISPLAY_TEXT.optional(),
+  thinking: RAW_DISPLAY_TEXT.optional(),
+});
+const OmpAssistantDisplayContentSchema = z.preprocess(
+  boundRawDisplayContent,
+  z.union([RAW_DISPLAY_TEXT, z.array(OmpAssistantContentPartSchema).max(OMP_MAX_CONTENT_PARTS)]),
+);
 const OmpDisplayContentSchema = z.union([
   TEXT,
   z.array(OmpContentPartSchema).max(OMP_MAX_CONTENT_PARTS),
@@ -371,7 +449,7 @@ export type OmpMessage = OmpMessageIdentity &
 const OmpMessageSchema: z.ZodType<OmpMessage> = z.union([
   z.object({
     role: z.literal("assistant"),
-    content: OmpDisplayContentSchema.optional(),
+    content: OmpAssistantDisplayContentSchema.optional(),
     ...OmpMessageIdentityShape,
     errorMessage: boundedString(4_096).nullable().optional(),
     stopReason: boundedString(64).optional(),
@@ -394,7 +472,13 @@ const OmpMessageSchema: z.ZodType<OmpMessage> = z.union([
   z.object({
     role: z.literal("bashExecution"),
     command: TEXT,
-    output: TEXT.optional(),
+    output: z.preprocess(
+      (value) =>
+        typeof value === "string" && utf8Bytes(value) > MAX_IMAGE_DATA_LENGTH
+          ? DISPLAY_TRUNCATION_MARKER
+          : value,
+      RAW_DISPLAY_TEXT.optional(),
+    ),
     exitCode: z.number().int().nullable().optional(),
     cancelled: z.boolean().optional(),
     truncated: z.boolean().optional(),
@@ -2247,13 +2331,7 @@ class OmpRpcProcess {
       this.recordProtocolViolation();
       return;
     }
-    if (this.receiveKnownResponse(decoded)) return;
-    const frame = JsonObjectSchema.safeParse(decoded);
-    if (!frame.success) {
-      this.recordProtocolViolation();
-      return;
-    }
-    this.receiveFrame(frame.data);
+    this.receiveDecodedFrame(decoded, payload.byteLength);
   }
 
   private receiveChunk(frame: ChunkFrame): void {
@@ -2323,13 +2401,33 @@ class OmpRpcProcess {
       this.recordProtocolViolation();
       return;
     }
-    if (this.receiveKnownResponse(decodedFrame)) return;
-    const frameObject = JsonObjectSchema.safeParse(decodedFrame);
-    if (!frameObject.success) {
+    this.receiveDecodedFrame(decodedFrame, reassembled.byteLength);
+  }
+
+  private receiveDecodedFrame(value: unknown, rawByteLength: number): void {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const frame = value as Record<string, unknown>;
+      const pending = typeof frame.id === "string" ? this.pending.get(frame.id) : undefined;
+      if (
+        frame.type === "response" &&
+        (pending?.command === "get_messages" || pending?.command === "get_subagent_messages")
+      ) {
+        this.receiveResponse(frame);
+        return;
+      }
+    }
+    if (rawByteLength > MAX_SEMANTIC_FRAME_BYTES) {
+      this.fail(new Error("OMP RPC frame exceeds the semantic byte limit"));
+      return;
+    }
+    if (this.receiveKnownResponse(value)) return;
+    const sanitized = sanitizeLiveDisplayFrame(value);
+    const frame = JsonObjectSchema.safeParse(sanitized);
+    if (!frame.success) {
       this.recordProtocolViolation();
       return;
     }
-    this.receiveFrame(frameObject.data);
+    this.receiveFrame(frame.data);
   }
 
   private receiveKnownResponse(value: unknown): boolean {
@@ -2471,7 +2569,7 @@ class OmpRpcProcess {
           structuralFrame.messages as unknown[],
           MAX_SEMANTIC_FRAME_BYTES,
           OMP_MAX_CONTENT_PARTS,
-          MAX_TEXT_LENGTH,
+          MAX_IMAGE_DATA_LENGTH,
           4_096,
         ) !== Number.POSITIVE_INFINITY);
     const payloadIsSafe =
