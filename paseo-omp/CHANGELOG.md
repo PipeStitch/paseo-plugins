@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.0](https://github.com/omercnet/paseo-plugins/compare/paseo-omp-v0.3.0...paseo-omp-v0.4.0) (2026-09-19)
+
+
+### Features
+
+* **paseo-omp:** add guided model role picker ([#108](https://github.com/omercnet/paseo-plugins/issues/108)) ([23be6ff](https://github.com/omercnet/paseo-plugins/commit/23be6ff4f8dd7aad8c331b08e50ce28820be4c56))
+* **paseo-omp:** add support diagnostics help report ([#120](https://github.com/omercnet/paseo-plugins/issues/120)) ([b567c87](https://github.com/omercnet/paseo-plugins/commit/b567c87a7a0a0e7cdb6da111e667ba1a15a4f651))
+
+
+### Bug Fixes
+
+* **paseo-omp:** accept bounded tool metadata ([#110](https://github.com/omercnet/paseo-plugins/issues/110)) ([102c6bf](https://github.com/omercnet/paseo-plugins/commit/102c6bfde945100784a7b5e69a5648520dbc5816))
+* **paseo-omp:** align environment preflight limits ([#113](https://github.com/omercnet/paseo-plugins/issues/113)) ([e93d12e](https://github.com/omercnet/paseo-plugins/commit/e93d12e84c250f87e93e96f980122361c51f1e4d))
+* **paseo-omp:** avoid Windows cleanup race ([#123](https://github.com/omercnet/paseo-plugins/issues/123)) ([15b3818](https://github.com/omercnet/paseo-plugins/commit/15b3818044433b0a701068b76ff5187a41b4cf02))
+* **paseo-omp:** branch directly from rewind tokens ([#114](https://github.com/omercnet/paseo-plugins/issues/114)) ([2ff4e6b](https://github.com/omercnet/paseo-plugins/commit/2ff4e6b6b48aff3ac13f0be82ebed8c513597a4b))
+* **paseo-omp:** degrade oversized host tool results ([#111](https://github.com/omercnet/paseo-plugins/issues/111)) ([3e9b35f](https://github.com/omercnet/paseo-plugins/commit/3e9b35fc1e2685c1597f5b8e616c1d7455911908))
+* **paseo-omp:** isolate subagent replay failures ([#118](https://github.com/omercnet/paseo-plugins/issues/118)) ([1161560](https://github.com/omercnet/paseo-plugins/commit/1161560ecfad830d1141a3956e0ae0a183b6b5d6))
+* **paseo-omp:** preserve large replay output ([#117](https://github.com/omercnet/paseo-plugins/issues/117)) ([6bdd879](https://github.com/omercnet/paseo-plugins/commit/6bdd879bafa99bccacc6476f030b6d10c669d1c5))
+* **paseo-omp:** preserve nested subagent links ([#105](https://github.com/omercnet/paseo-plugins/issues/105)) ([41b3b87](https://github.com/omercnet/paseo-plugins/commit/41b3b8760cb88be2381f723e400f71469cb1685c))
+* **paseo-omp:** preserve transcript when image replay fails ([#112](https://github.com/omercnet/paseo-plugins/issues/112)) ([b982226](https://github.com/omercnet/paseo-plugins/commit/b9822269faadf36918781b243959b76fbcfea4f9))
+* **paseo-omp:** report protocol violations safely ([#119](https://github.com/omercnet/paseo-plugins/issues/119)) ([c63c244](https://github.com/omercnet/paseo-plugins/commit/c63c24423b8ef5e999688c9a8c931a6bf5a0d514))
+* **paseo-omp:** tolerate optional catalog metadata ([#115](https://github.com/omercnet/paseo-plugins/issues/115)) ([2dbd8f6](https://github.com/omercnet/paseo-plugins/commit/2dbd8f6934757c8ee5b04ec1cc0f2b1f256d2051))
+
 ## [0.3.0](https://github.com/omercnet/paseo-plugins/compare/paseo-omp-v0.2.1...paseo-omp-v0.3.0) (2026-09-18)
 
 
