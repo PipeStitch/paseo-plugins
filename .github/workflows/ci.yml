@@ -2,8 +2,22 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore:
+      - 'AGENTS.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - 'AGENTS.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '**/*.md'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
